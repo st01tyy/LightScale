@@ -1,0 +1,132 @@
+main: main_async_actor
+training:
+  output_dir: './quickstarts/Qwen3-8B_GRPO/training_outputs' # 输出目录
+  from_pretrained: './megatron_models/Qwen3-8B-Base' # actor模型加载路径，megatron core格式
+  resume_checkpoint: null # 断点续训actor模型加载目录，megatron core格式
+  max_steps: 314 # 最大rollout步数
+  save_steps: 20 # 保存ckpt步数
+  non_persistent_save_steps: 5 # 非持久化保存 步数间隔，0表示禁用
+  early_stop_steps: 400 # 训练提前终止步数
+  save_test_step: 3 # 训练开始后第几步测试保存ckpt，用于防止内存问题
+  optim:
+    lr: 1e-6 # 学习率
+    min_lr: 1e-6 # 衰减最小学习率
+    warmup_steps: 10
+    scheduler_type: constant # constant # 学习率衰减类型
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.98
+    adam_eps: 1e-8
+  seed: 42
+  rollout_batch_size: 128 # 每rollout步样本数量
+  global_batch_size: 1024 # 每个训练步的训练数据量
+  n_samples: &n_samples 8 # 每个样本的采样次数
+  micro_batch_size: 1 # 训练步micro batch size
+  micro_forward_batch_size: 1 # 每个rollout步计算old_actor_logps时的batch size
+  max_length: 8192 # 数据处理时prompt + response最大截断长度
+  pad_to_max_length: True # False # True # 在collate_fn里将序列补齐到max_length或动态补齐到每个train batch的最大长度
+  dump_experience: True # 是否将采样结果、reward等数据保存
+  dump_tensors: False # 是否将tensor保存
+  log_level: info # info # info or debug # 日志级别
+  use_outcome_rewards_as_advantages: True # False # 直接使用reward作为advantage，跳过计算advantage
+  skip_zero_reward_sample: True # 训练时跳过归一化得分为0的样本
+  policy_loss_limit: 3.9 # 训练时policy loss大小限制，超过则跳过当前样本
+  kl_loss_limit: 10 # 训练时kl loss大小限制，超过则跳过当前样本
+  mlp_weight_merging_batch_size: 8 # 合并MLP层时每个pp stage的层数批大小
+  entropy_loss_threshold: 0.3 # 熵损失生效阈值，低于阈值时在总loss上加入熵损失
+  moe_weight_merging_layer_batch_size: 10 # 合并MOE层时每个pp stage的层数批次大小
+  moe_weight_merging_expert_batch_size: 10 # 合并MOE层时每层的专家批次大小
+algorithm:
+  init_kl_coef: 0.0 # 大于等于1e-8时启用reference model
+  use_kl_loss: False # 是否使用kl loss
+  kl_estimator: k3
+  advantage_estimator: 'grpo'
+  reward_clip_range: null
+  num_repeat_times: 1
+  entropy_loss_coef: 0.0 # entropy loss系数，大于0时计算
+  policy_loss_coef: 1.0 # RL loss系数，设置为0启用纯蒸馏训练
+  negate_kl_loss: False # 是否将kl loss取反
+actor:
+  tp: 2 # 张量（模型）并行
+  pp: 2 # 流水并行
+  cp: 1 # 序列并行
+  dp: 2 # 数据并行
+  moe: null
+  weight_update_group_port: 65500
+  pack_n_samples: False # 尚未实现
+  extra_args:
+    - key: recompute-granularity
+      value: full # 完全重计算
+    - key: recompute-method
+      value: uniform # 完全重计算
+    - key: recompute-num-layers
+      value: 1 # 重计算层数
+    - key: no-load-rng
+      value: null
+reference:
+  micro_batch_size: 2 # 前向计算batch size
+  tp: 2
+  pp: 1
+  cp: 1
+  dp: 4
+  moe:
+    ep: 1 # 专家并行
+    etp: null # 专家张量并行
+  load_path: null # ref模型加载路径
+distributed_lock_server:
+  port: 13266 # 分布式锁服务器端口
+weight_updater_test: null
+distillation:
+  enabled: False # 是否启用蒸馏训练
+  logits_express:
+    dtype: fp32 # support: fp32, fp16, bf16
+    batch_size: 4 # transfer batch size
+    base_port: 45000 # transfer base port
+  gkd:
+    student_temperature: 1.0
+    teacher_temperature: 1.0
+    beta: 0.0 # beta of gkd
+    seq_kd: False # whether to use sequence-level kd
+async_rollout:
+  data: './quickstarts/Qwen3-8B_GRPO/deepscaler_r1_zero' # 数据集路径
+  actor_service_name: actor_model # actor模型服务名称
+  services:
+    - type: sglang
+      name: actor_model
+      resource_cfg:
+        type: sglang
+        is_gpu_resource: True
+        base_port: 18580
+        num_instances: 1
+        params:
+          model_path: './hf_models/Qwen3-8B-Base'
+          tp: 8 # 张量并行
+          enable_ep: False # 启用专家并行
+          dist_base_port: 23380
+          extra_args:
+            - key: mem-fraction-static
+              value: 0.8
+            - key: cuda-graph-bs
+              value: '8 32 64 128'
+      params: 
+        health_timeout: 2 # 健康检查超时时间，单位秒
+        health_retries: 450 # 健康检查重试次数
+        startup_timeout: 1000
+        max_concurrent_per_resource: 128 # 每个资源最大worker数量
+      resources: [] # will be set by headquaters
+  workers:
+    - type: single_turn
+      handle_data_types: null
+      params:
+        n_samples: *n_samples
+        max_tokens: 6500
+        advantage_estimator: 'grpo'
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+        force_thinking: true
+        begin_of_thinking: "<THINK>"
+    - type: math
+      handle_data_types: ['deepscaler']
+      params: 
+        use_cot_reward: true
+        use_ref_answers: false

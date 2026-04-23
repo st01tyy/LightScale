@@ -1,0 +1,46 @@
+main: main_sft
+training:
+  output_dir: null # 输出目录
+  from_pretrained: null # 模型加载路径，megatron core格式
+  resume_checkpoint: null # 断点续训模型加载目录，megatron core格式
+  max_steps: 315 # 最大训练步数
+  save_steps: 5 # 保存ckpt步数
+  non_persistant_save_steps: 0 # 非持久化保存步数间隔，0表示禁用
+  early_stop_steps: 400 # 训练提前终止步数
+  save_test_step: 5 # 训练开始后第几步测试保存ckpt，用于防止内存问题
+  optim:
+    lr: 5e-7 # 学习率
+    min_lr: 5e-8 # 衰减最小学习率
+    warmup_steps: 50 # warm up步数，优先级高于warmup_ratio
+    warmup_ratio: 0.03 # warm up步数比例
+    scheduler_type: cosine # 学习率衰减类型，可选项：constant, linear, cosine
+    weight_decay: 0.1
+  data: null # huggingface datasets格式数据集加载路径
+  seed: 42
+  shuffle: False # 是否打乱数据
+  global_batch_size: 48 # 每个训练步的训练数据量
+  micro_batch_size: 1 # 训练步micro batch size
+  max_length: 4096 # 数据处理时最大截断长度
+  pad_to_max_length: False # True # 在collate_fn里将序列补齐到max_length或动态补齐到每个train batch的最大长度
+  log_level: info # info or debug # 日志级别
+  sequence_packing: False # 是否启用序列Packing，若启用，数据集需包含cu_seqlens字段
+  ignore_token_id: -100 # 损失计算时忽略的token id
+  use_token_mean: False # 是否使用token平均损失
+actor:
+  master_port: 13380 # 分布式通信端口
+  tp: 4 # 张量（模型）并行
+  pp: 2 # 流水并行
+  cp: 1 # 序列并行
+  dp: 8 # 数据并行
+  moe:
+    ep: 1 # 专家并行
+    etp: null # 专家张量并行
+  extra_args:
+    - key: recompute-granularity
+      value: selective # 选择重计算
+    # - key: recompute-granularity
+    #   value: full # 完全重计算
+    # - key: recompute-method
+    #   value: uniform # 完全重计算
+    # - key: recompute-num-layers
+    #   value: 1 # 重计算层数
