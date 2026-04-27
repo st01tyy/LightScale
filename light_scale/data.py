@@ -1,5 +1,6 @@
 from typing import List, Optional
 from dataclasses import dataclass
+import numpy as np
 import torch
 
 @dataclass
@@ -30,6 +31,9 @@ class MultiResponseSample:
     normed_rewards: List[float] = None
     completion_tokens: int = None
     total_tokens: int = None
+    group_content_ids: Optional[List[np.ndarray]] = None
+    group_loss_mask: Optional[List[np.ndarray]] = None
+    group_teacher_log_probs: Optional[List[np.ndarray]] = None
 
 @dataclass
 class Sample:

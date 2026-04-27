@@ -52,6 +52,7 @@ def get_async_rollout_config(config: Dict[str, Any]) -> Dict[str, Any]:
 		if worker_cfg.get("type") is None:
 			raise RolloutInitializationError("每个 worker 必须包含 type 字段")
 	if teacher_models_registry is not None:
+		teacher_data_types = set()
 		for registry_entry in teacher_models_registry:
 			if not isinstance(registry_entry, dict):
 				raise RolloutInitializationError("teacher_models_registry 的每个条目必须是字典")
@@ -60,4 +61,26 @@ def get_async_rollout_config(config: Dict[str, Any]) -> Dict[str, Any]:
 			data_types = registry_entry.get("data_type")
 			if not isinstance(data_types, list):
 				raise RolloutInitializationError("teacher_models_registry.data_type 必须是列表")
+			for data_type in data_types:
+				if isinstance(data_type, str) and data_type:
+					teacher_data_types.add(data_type)
+
+		shared_llm_judge_cfg = async_cfg.get("llm_judge") or {}
+		for worker_cfg in workers_cfg:
+			if worker_cfg.get("type") != "llm_judge":
+				continue
+			handle_data_types = worker_cfg.get("handle_data_types")
+			if not isinstance(handle_data_types, list) or not handle_data_types:
+				continue
+			if not any(data_type in teacher_data_types for data_type in handle_data_types):
+				continue
+			worker_params = worker_cfg.get("params") or {}
+			use_ref_answers = worker_params.get(
+				"use_ref_answers",
+				shared_llm_judge_cfg.get("use_ref_answers", False),
+			)
+			if use_ref_answers:
+				raise RolloutInitializationError(
+					"teacher mode 当前要求 rollout response 保持原样，不能与 llm_judge.use_ref_answers 同时开启"
+				)
 	return async_cfg

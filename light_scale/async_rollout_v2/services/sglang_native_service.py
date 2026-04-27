@@ -13,7 +13,7 @@ from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
 from light_scale.data import Resource
 
 
-LogprobTuple = Tuple[float, int, Optional[str]]
+LogprobTuple = Tuple[Optional[float], int, Optional[str]]
 TopLogprobList = List[LogprobTuple]
 
 
@@ -395,13 +395,13 @@ class AsyncSGLangNativeService(AsyncBaseService):
 		logprob = value[0]
 		token_id = value[1]
 		token_text = value[2]
-		if not isinstance(logprob, (int, float)):
+		if logprob is not None and not isinstance(logprob, (int, float)):
 			raise RuntimeError(f"SGLang native logprob value is invalid: {value}")
 		if not isinstance(token_id, int):
 			raise RuntimeError(f"SGLang native token id is invalid: {value}")
 		if token_text is not None and not isinstance(token_text, str):
 			token_text = str(token_text)
-		return (float(logprob), token_id, token_text)
+		return (None if logprob is None else float(logprob), token_id, token_text)
 
 	def _validate_task(self, task: SGLangNativeGenerateTask) -> None:
 		has_text = task.text is not None
