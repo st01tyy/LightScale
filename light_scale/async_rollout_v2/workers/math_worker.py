@@ -72,6 +72,7 @@ class AsyncMathWorker(AsyncSingleTurnWorker):
 		service_dict: Dict[str, AsyncBaseService],
 		stop_event,
 		log_level: int,
+		teacher_service_name: str = None,
 		**worker_cfg,
 	):
 		super().__init__(
@@ -79,6 +80,7 @@ class AsyncMathWorker(AsyncSingleTurnWorker):
 			service_dict=service_dict,
 			stop_event=stop_event,
 			log_level=log_level,
+			teacher_service_name=teacher_service_name,
 			**worker_cfg,
 		)
 

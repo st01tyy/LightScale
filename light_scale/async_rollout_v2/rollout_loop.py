@@ -12,6 +12,7 @@ from light_scale.data import MultiResponseSample, Resource
 from light_scale.async_rollout_v2.executors import get_process_pool, close_all, get_thread_pool
 from light_scale.async_rollout_v2.registries import SERVICE_CLASS_REGISTRY, WORKER_CLASS_REGISTRY
 from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
+from light_scale.async_rollout_v2.services.sglang_native_service import AsyncSGLangNativeService
 from light_scale.async_rollout_v2.workers.base_worker import AsyncBaseWorker
 
 
@@ -103,6 +104,7 @@ async def _initialize_rollout_context(
 	Dict[str, AsyncBaseService],
 	Dict[Type[AsyncBaseWorker], Dict[str, Any]],
 	Dict[str, Type[AsyncBaseWorker]],
+	Dict[str, str],
 	datasets.Dataset,
 ]:
 	services_cfg = async_cfg.get("services") or []
@@ -125,12 +127,20 @@ async def _initialize_rollout_context(
 		type_to_worker_params,
 		data_type_to_worker_type,
 		) = _prepare_worker_params(workers_cfg, logger, async_cfg.get("llm_judge") or {})
+	data_type_to_teacher_service_name = _build_teacher_service_registry(async_cfg, name_to_services)
 	
 	samples = await _load_dataset(async_cfg.get("data"), logger)
 	samples = samples.shuffle(seed=42)
 	_ensure_worker_service_dependencies(type_to_worker_params, name_to_services)
+	_ensure_teacher_registry_dependencies(data_type_to_teacher_service_name, name_to_services)
 	_ensure_data_worker_dependencies(data_type_to_worker_type, samples)
-	return name_to_services, type_to_worker_params, data_type_to_worker_type, samples
+	return (
+		name_to_services,
+		type_to_worker_params,
+		data_type_to_worker_type,
+		data_type_to_teacher_service_name,
+		samples,
+	)
 
 
 async def _run_rollout_loop(
@@ -140,6 +150,7 @@ async def _run_rollout_loop(
 	name_to_services: Dict[str, AsyncBaseService],
 	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]],
 	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]],
+	data_type_to_teacher_service_name: Dict[str, str],
 	input_queue,
 	output_queue,
 	stop_event,
@@ -175,6 +186,7 @@ async def _run_rollout_loop(
 			batch_samples=batch_samples,
 			data_type_to_worker_type=data_type_to_worker_type,
 			type_to_worker_params=type_to_worker_params,
+			data_type_to_teacher_service_name=data_type_to_teacher_service_name,
 			name_to_services=name_to_services,
 			stop_event=stop_event,
 			output_queue=output_queue,
@@ -187,6 +199,7 @@ async def _execute_batch(
 	batch_samples: datasets.Dataset,
 	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]],
 	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]],
+	data_type_to_teacher_service_name: Dict[str, str],
 	name_to_services: Dict[str, AsyncBaseService],
 	stop_event,
 	output_queue,
@@ -200,14 +213,17 @@ async def _execute_batch(
 	for sample in batch_samples:
 		if stop_event.is_set():
 			break
-		worker_cls = data_type_to_worker_type[sample["dataset_type"]]
+		dataset_type = sample["dataset_type"]
+		worker_cls = data_type_to_worker_type[dataset_type]
 		worker_params = type_to_worker_params.get(worker_cls, dict())
+		teacher_service_name = data_type_to_teacher_service_name.get(dataset_type)
 		try:
 			worker = worker_cls(
 				input_data=sample,
 				service_dict=name_to_services,
 				stop_event=stop_event,
 				log_level=log_level,
+				teacher_service_name=teacher_service_name,
 				**worker_params,
 			)
 			logger.debug(
@@ -318,6 +334,46 @@ def _build_resources(resources_cfg: List[Dict[str, Any]]) -> List[Resource]:
 	return resources
 
 
+def _build_teacher_service_registry(
+	async_cfg: Dict[str, Any],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> Dict[str, str]:
+	teacher_models_registry = async_cfg.get("teacher_models_registry")
+	if teacher_models_registry is None:
+		return {}
+	if not isinstance(teacher_models_registry, list):
+		raise RolloutInitializationError("teacher_models_registry 必须是列表或 null")
+
+	data_type_to_teacher_service_name: Dict[str, str] = {}
+	for registry_entry in teacher_models_registry:
+		if not isinstance(registry_entry, dict):
+			raise RolloutInitializationError("teacher_models_registry 的每个条目必须是字典")
+		service_name = registry_entry.get("service_name")
+		data_types = registry_entry.get("data_type")
+		if not isinstance(service_name, str) or not service_name:
+			raise RolloutInitializationError("teacher_models_registry.service_name 必须是非空字符串")
+		if not isinstance(data_types, list) or not data_types:
+			raise RolloutInitializationError("teacher_models_registry.data_type 必须是非空列表")
+		service_instance = name_to_services.get(service_name)
+		if service_instance is None:
+			raise RolloutInitializationError(
+				f"teacher_models_registry 引用的 service {service_name} 未成功启动"
+			)
+		if not isinstance(service_instance, AsyncSGLangNativeService):
+			raise RolloutInitializationError(
+				f"teacher_models_registry 引用的 service {service_name} 必须是 AsyncSGLangNativeService"
+			)
+		for data_type in data_types:
+			if not isinstance(data_type, str) or not data_type:
+				raise RolloutInitializationError("teacher_models_registry.data_type 中的元素必须是非空字符串")
+			if data_type in data_type_to_teacher_service_name:
+				raise RolloutInitializationError(
+					f"dataset_type {data_type} 在 teacher_models_registry 中重复声明"
+				)
+			data_type_to_teacher_service_name[data_type] = service_name
+	return data_type_to_teacher_service_name
+
+
 def _prepare_worker_params(
 	worker_cfgs: List[Dict[str, Any]],
 	logger: logging.Logger,
@@ -391,6 +447,22 @@ def _ensure_worker_service_dependencies(
 				raise RolloutInitializationError(
 					f"worker {worker_cls.__name__} 依赖的 service {service_name} 未成功启动"
 				)
+
+
+def _ensure_teacher_registry_dependencies(
+	data_type_to_teacher_service_name: Dict[str, str],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> None:
+	for dataset_type, service_name in data_type_to_teacher_service_name.items():
+		service_instance = name_to_services.get(service_name)
+		if service_instance is None:
+			raise RolloutInitializationError(
+				f"dataset_type {dataset_type} 依赖的 teacher service {service_name} 未成功启动"
+			)
+		if not isinstance(service_instance, AsyncSGLangNativeService):
+			raise RolloutInitializationError(
+				f"dataset_type {dataset_type} 依赖的 teacher service {service_name} 不是 AsyncSGLangNativeService"
+			)
 
 
 def _ensure_data_worker_dependencies(

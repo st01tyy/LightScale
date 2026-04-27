@@ -37,6 +37,9 @@ def get_async_rollout_config(config: Dict[str, Any]) -> Dict[str, Any]:
 	workers_cfg = async_cfg.get("workers") or []
 	if not isinstance(workers_cfg, list):
 		raise RolloutInitializationError("async_rollout.workers 必须是列表")
+	teacher_models_registry = async_cfg.get("teacher_models_registry")
+	if teacher_models_registry is not None and not isinstance(teacher_models_registry, list):
+		raise RolloutInitializationError("async_rollout.teacher_models_registry 必须为列表或 null")
 	for service_cfg in services_cfg:
 		if service_cfg.get("name") is None or service_cfg.get("type") is None:
 			raise RolloutInitializationError("每个 service 必须包含 type 与 name")
@@ -48,4 +51,13 @@ def get_async_rollout_config(config: Dict[str, Any]) -> Dict[str, Any]:
 	for worker_cfg in workers_cfg:
 		if worker_cfg.get("type") is None:
 			raise RolloutInitializationError("每个 worker 必须包含 type 字段")
+	if teacher_models_registry is not None:
+		for registry_entry in teacher_models_registry:
+			if not isinstance(registry_entry, dict):
+				raise RolloutInitializationError("teacher_models_registry 的每个条目必须是字典")
+			if registry_entry.get("service_name") is None:
+				raise RolloutInitializationError("teacher_models_registry 的每个条目必须包含 service_name")
+			data_types = registry_entry.get("data_type")
+			if not isinstance(data_types, list):
+				raise RolloutInitializationError("teacher_models_registry.data_type 必须是列表")
 	return async_cfg

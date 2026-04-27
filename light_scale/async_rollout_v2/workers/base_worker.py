@@ -29,11 +29,13 @@ class AsyncBaseWorker(ABC):
 		service_dict: Dict[str, AsyncBaseService],
 		stop_event,
 		log_level: int,
+		teacher_service_name: Optional[str] = None,
 		**worker_cfg,
 	):
 		super().__init__()
 		self.input_data = input_data
 		self.service_dict = service_dict
+		self.teacher_service_name = teacher_service_name
 		if stop_event is None:
 			raise ValueError("AsyncBaseWorker 初始化需要 stop_event")
 		self.stop_event = stop_event
@@ -81,6 +83,7 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 		service_dict: Dict[str, AsyncBaseService],
 		stop_event,
 		log_level: int,
+		teacher_service_name: Optional[str] = None,
 		**worker_cfg,
 	):
 		super().__init__(
@@ -88,6 +91,7 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 			service_dict=service_dict,
 			stop_event=stop_event,
 			log_level=log_level,
+			teacher_service_name=teacher_service_name,
 		)
 		if "advantage_estimator" not in worker_cfg:
 			raise ValueError("AsyncSingleTurnWorker 需要提供 advantage_estimator 配置")

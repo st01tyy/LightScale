@@ -230,6 +230,45 @@ def _make_sure_service_names_unique_and_valid(services_cfg: List[Dict[str, Any]]
         service_names.add(name)
     if actor_service_name not in service_names:
         raise ValueError(f"actor_service_name '{actor_service_name}' 不在 services 配置中")
+
+
+def _validate_teacher_models_registry(async_cfg: Dict[str, Any]) -> None:
+    teacher_models_registry = async_cfg.get("teacher_models_registry")
+    if teacher_models_registry is None:
+        return
+    if not isinstance(teacher_models_registry, list):
+        raise ValueError("teacher_models_registry 必须为列表或 null")
+
+    services_cfg = async_cfg.get("services") or []
+    service_name_to_type = {}
+    for service_cfg in services_cfg:
+        service_name = service_cfg.get("name")
+        service_type = service_cfg.get("type")
+        if service_name:
+            service_name_to_type[service_name] = service_type
+
+    seen_data_types = set()
+    for registry_entry in teacher_models_registry:
+        if not isinstance(registry_entry, dict):
+            raise ValueError("teacher_models_registry 的每个条目必须是字典")
+        service_name = registry_entry.get("service_name")
+        data_types = registry_entry.get("data_type")
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError("teacher_models_registry.service_name 必须是非空字符串")
+        if service_name not in service_name_to_type:
+            raise ValueError(f"teacher_models_registry 引用的 service {service_name} 未在 services 中定义")
+        if service_name_to_type[service_name] != "sglang_native":
+            raise ValueError(
+                f"teacher_models_registry 引用的 service {service_name} 必须是 sglang_native 类型"
+            )
+        if not isinstance(data_types, list) or not data_types:
+            raise ValueError("teacher_models_registry.data_type 必须是非空列表")
+        for data_type in data_types:
+            if not isinstance(data_type, str) or not data_type:
+                raise ValueError("teacher_models_registry.data_type 中的元素必须是非空字符串")
+            if data_type in seen_data_types:
+                raise ValueError(f"teacher_models_registry 中重复声明了 dataset_type: {data_type}")
+            seen_data_types.add(data_type)
     
 def _validate_existing_resource(resource: Dict[str, Any]) -> None:
     # 检查 resource 配置的合法性
@@ -290,6 +329,7 @@ def _allocate_async_services(
     assert len(services_cfg) > 0, "services 列表不能为空，至少有一个actor模型推理服务"
     assert "actor_service_name" in async_cfg, "async_rollout 配置中缺少 actor_service_name 字段"
     _make_sure_service_names_unique_and_valid(services_cfg, async_cfg["actor_service_name"])
+    _validate_teacher_models_registry(async_cfg)
 
     cpu_node_cursor = 0
     for service_cfg in services_cfg:

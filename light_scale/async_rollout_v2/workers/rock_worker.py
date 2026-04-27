@@ -71,6 +71,7 @@ class RockWorker(AsyncBaseWorker):
 		service_dict: Dict[str, AsyncBaseService],
 		stop_event,
 		log_level: int,
+		teacher_service_name: Optional[str] = None,
 		**worker_cfg,
 	):
 		super().__init__(
@@ -78,6 +79,7 @@ class RockWorker(AsyncBaseWorker):
 			service_dict=service_dict,
 			stop_event=stop_event,
 			log_level=log_level,
+			teacher_service_name=teacher_service_name,
 		)
 		self._config = RockWorkerConfig(**worker_cfg)
 		self._rock_service = self._require_rock_service(self._config.rock_service_name)
