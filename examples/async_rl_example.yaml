@@ -95,6 +95,7 @@ distillation:
 async_rollout:
   data: '' # 数据集路径
   actor_service_name: actor_model # actor模型服务名称
+  teacher_models_registry: null
   services:
     - type: sglang
       name: actor_model
@@ -116,7 +117,6 @@ async_rollout:
       resources: [] # will be set by headquaters
   workers:
     - type: single_turn
-      handle_data_types: ['default', 'others']
       params:
         n_samples: 8
         max_tokens: 2048
