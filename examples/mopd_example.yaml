@@ -1,0 +1,152 @@
+main: main_async_actor
+training:
+  output_dir: null # 输出目录
+  from_pretrained: null # actor模型加载路径，megatron core格式
+  rollout_model_name: null # actor rollout推理服务加载路径，huggingface格式
+  resume_checkpoint: null # 断点续训actor模型加载目录，megatron core格式
+  max_steps: 315 # 最大rollout步数
+  save_steps: 5 # 保存ckpt步数
+  early_stop_steps: 400 # 训练提前终止步数
+  non_persistent_save_steps: 0 # 非持久化保存步数间隔，0表示禁用
+  save_test_step: 5 # 训练开始后第几步测试保存ckpt，用于防止内存问题
+  optim:
+    lr: 5e-7 # 学习率
+    min_lr: 5e-8 # 衰减最小学习率
+    warmup_ratio: 0.03 # warm up步数比例
+    scheduler_type: cosine # 学习率衰减类型
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.98
+    adam_eps: 1e-8
+  seed: 42
+  rollout_batch_size: 256 # 每rollout步样本数量
+  global_batch_size: 2048 # 每个训练步的训练数据量
+  n_samples: 8 # 每个样本的采样次数
+  micro_batch_size: 1 # 训练步micro batch size
+  micro_forward_batch_size: 4 # 每个rollout步计算old_actor_logps时的batch size
+  max_length: 4096 # 数据处理时prompt + response最大截断长度
+  pad_to_max_length: false # 在collate_fn里将序列补齐到max_length或动态补齐到每个train batch的最大长度
+  dump_experience: true # 是否将采样结果、reward等数据保存
+  dump_tensors: false # 是否将tensor保存
+  log_level: info # info or debug
+  use_outcome_rewards_as_advantages: true # 设为true以跳过前置 advantage 计算；MOPD 的 advantage 在 opd_loss_func 中由 teacher_logps - student_logps 现算
+  skip_zero_reward_sample: true
+  policy_loss_limit: 3.25
+  kl_loss_limit: 10
+  mlp_weight_merging_batch_size: 24
+  entropy_loss_threshold: 0.3
+  moe_weight_merging_layer_batch_size: 10
+  moe_weight_merging_expert_batch_size: 10
+algorithm:
+  init_kl_coef: 0.0 # MOPD 示例默认不启用 reference model
+  use_kl_loss: false
+  kl_estimator: k3
+  advantage_estimator: grpo
+  reward_clip_range: null
+  num_repeat_times: 1
+  entropy_loss_coef: 0.001 # OPD 路径仍保留 entropy loss
+  policy_loss_coef: 1.0 # OPD loss 主系数
+  negate_kl_loss: false
+actor:
+  tp: 4
+  pp: 2
+  cp: 1
+  dp: 8
+  moe:
+    ep: 1
+    etp: null
+  weight_update_group_port: 65500
+  pack_n_samples: false
+  extra_args:
+    - key: recompute-granularity
+      value: selective
+reference:
+  micro_batch_size: 2
+  tp: 2
+  pp: 1
+  cp: 1
+  dp: 4
+  moe:
+    ep: 1
+    etp: null
+  load_path: null
+distributed_lock_server:
+  port: 13266
+weight_updater_test:
+  online_test: false
+distillation:
+  enabled: false # 这里必须保持 false；teacher logprob 蒸馏不走 GKD/distillation_step 分支
+  logits_express:
+    dtype: fp32
+    batch_size: 4
+    base_port: 45000
+  gkd:
+    student_temperature: 1.0
+    teacher_temperature: 1.0
+    beta: 0.0
+    seq_kd: false
+async_rollout:
+  data: '' # 数据集路径
+  actor_service_name: actor_model
+  teacher_models_registry:
+    - service_name: teacher_model
+      data_type: ['math', 'deepscaler'] # 命中这些 data_type 时，worker 会请求 teacher_model 返回 prompt logprobs
+  services:
+    - type: sglang
+      name: actor_model
+      resource_cfg:
+        type: sglang
+        is_gpu_resource: true
+        base_port: 18580
+        num_instances: 4
+        params:
+          model_path: ''
+          tp: 2
+          enable_ep: false
+          dist_base_port: 23380
+      params:
+        health_timeout: 300
+        health_retries: 3
+        startup_timeout: 300
+        max_concurrent_per_resource: 2
+      resources: [] # will be set by headquarters
+    - type: sglang_native
+      name: teacher_model
+      resource_cfg:
+        type: sglang
+        is_gpu_resource: true
+        base_port: 19580
+        num_instances: 4
+        params:
+          model_path: '' # teacher模型hf路径
+          tp: 2
+          enable_ep: false
+          dist_base_port: 24380
+      params:
+        health_timeout: 300
+        health_retries: 3
+        startup_timeout: 300
+        request_timeout: 300
+        retry: 3
+        max_concurrent_per_resource: 2
+        default_return_text_in_logprobs: false
+      resources: [] # will be set by headquarters
+  workers:
+    - type: single_turn
+      params:
+        n_samples: 8
+        max_tokens: 2048
+        advantage_estimator: grpo
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+    - type: math
+      handle_data_types: ['math', 'deepscaler']
+      params:
+        n_samples: 8
+        max_tokens: 2048
+        advantage_estimator: grpo
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+        tokenizer_path: '' # 必填；teacher mode 下 rollout worker 用它把消息编码成 content_ids/loss_mask
+        use_cot_reward: true
+        use_ref_answers: false

@@ -40,6 +40,9 @@ class Sample:
     prompt: str = None
     response: str = None
     messages: List[Message] = None
+    content_ids: np.ndarray = None
+    loss_mask: np.ndarray = None
+    teacher_log_probs: np.ndarray = None
     reward: float = None
     normed_reward: float = None
     completion_tokens: float = None
@@ -54,6 +57,7 @@ class BatchExperience:
     input_ids: torch.Tensor = None
     labels: torch.Tensor = None
     loss_mask: torch.Tensor = None
+    teacher_logps: torch.Tensor = None
     outcome_rewards: torch.Tensor = None
     actor_logps: torch.Tensor = None
     old_actor_logps: torch.Tensor = None

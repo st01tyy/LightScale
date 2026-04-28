@@ -1,5 +1,4 @@
 from typing import List, Optional, Tuple, Union, Iterator, Dict
-from dataclasses import asdict, dataclass
 import os
 from numbers import Number
 
@@ -110,6 +109,34 @@ class GRPOTrainer:
             input_ids.extend(message_ids)
             loss_mask.extend([0.0 if message.is_masked else 1.0] * len(message_ids))
         return input_ids, loss_mask
+
+    @staticmethod
+    def _sample_uses_teacher_logps(sample: Sample) -> bool:
+        return (
+            sample.content_ids is not None
+            or sample.loss_mask is not None
+            or sample.teacher_log_probs is not None
+        )
+
+    @staticmethod
+    def _sample_to_dump_dict(sample: Sample) -> Dict[str, object]:
+        content_ids = sample.content_ids
+        loss_mask = sample.loss_mask
+        teacher_log_probs = sample.teacher_log_probs
+        return {
+            "prompt": sample.prompt,
+            "response": sample.response,
+            "reward": sample.reward,
+            "normed_reward": sample.normed_reward,
+            "completion_tokens": sample.completion_tokens,
+            "reward_metrics": sample.reward_metrics,
+            "ground_truth": sample.ground_truth,
+            "dataset_type": sample.dataset_type,
+            "sample_id": sample.sample_id,
+            "content_len": None if content_ids is None else int(len(content_ids)),
+            "loss_mask_sum": None if loss_mask is None else float(np.asarray(loss_mask).sum()),
+            "teacher_log_probs_len": None if teacher_log_probs is None else int(len(teacher_log_probs)),
+        }
 
     def __init__(
             self, 
@@ -683,16 +710,7 @@ class GRPOTrainer:
     def dump_rollout_fn(self, iter: int, samples: List[Sample], dump_path: str):
         with open(f"{dump_path}/iter_{iter}_samples.jsonl", mode='a', encoding='utf-8') as f:
             for sample in samples:
-                # raw_line = json.dumps({
-                #     "prompt": sample.prompt,
-                #     "response": sample.response,
-                #     "reward": sample.reward,
-                #     "normed_reward": sample.normed_reward,
-                #     "ground_truth": sample.ground_truth,
-                #     "dataset_type": sample.dataset_type,
-                #     "reward_metrcis": sample.reward_metrics
-                # }, ensure_ascii=False)
-                raw_line = json.dumps(asdict(sample), ensure_ascii=False)
+                raw_line = json.dumps(self._sample_to_dump_dict(sample), ensure_ascii=False)
                 f.write(raw_line)
                 f.write('\n')
             f.flush()
@@ -722,7 +740,7 @@ class GRPOTrainer:
                 np.save(f"{dump_path_prefix}_{key}.npy", np_array)
         with open(f"{dump_path_prefix}_samples.jsonl", mode='w', encoding='utf-8') as f:
             for sample in samples:
-                raw_line = json.dumps(asdict(sample), ensure_ascii=False)
+                raw_line = json.dumps(self._sample_to_dump_dict(sample), ensure_ascii=False)
                 f.write(raw_line)
                 f.write('\n')
                 f.flush()
@@ -747,14 +765,18 @@ class GRPOTrainer:
         input_ids = None
         labels = None
         loss_mask = None
+        teacher_logps = None
         outcome_rewards = None
+        need_teacher_logps = False
 
         if dist.get_rank() == 0:
             # keep the gpu tensor
             input_ids = batch_experience.input_ids
             labels = batch_experience.labels
             loss_mask = batch_experience.loss_mask
+            teacher_logps = batch_experience.teacher_logps
             outcome_rewards = batch_experience.outcome_rewards
+            need_teacher_logps = teacher_logps is not None
         
         if batch_experience is None:
             batch_experience = BatchExperience()
@@ -762,6 +784,16 @@ class GRPOTrainer:
         batch_experience.input_ids = torch.zeros((shape_tensor[0], shape_tensor[1]), dtype=torch.int64, device="cpu", pin_memory=True)
         batch_experience.labels = torch.zeros((shape_tensor[0], shape_tensor[1]), dtype=torch.int64, device="cpu", pin_memory=True)
         batch_experience.loss_mask = torch.zeros((shape_tensor[0], shape_tensor[1]), dtype=torch.float32, device="cpu", pin_memory=True)
+        need_teacher_logps_tensor = dist_utils._sync_2D_input_data(
+            torch.tensor([[int(need_teacher_logps)]], dtype=torch.int32, device=dist_utils.get_device()) if dist.get_rank() == 0 else None,
+            torch.int32,
+            shape_tensor=torch.LongTensor([1, 1]),
+        )
+        need_teacher_logps = bool(need_teacher_logps_tensor[0, 0].item())
+        if need_teacher_logps:
+            batch_experience.teacher_logps = torch.zeros((shape_tensor[0], shape_tensor[1]), dtype=torch.float32, device="cpu", pin_memory=True)
+        else:
+            batch_experience.teacher_logps = None
         batch_experience.outcome_rewards = torch.zeros((shape_tensor[0],), dtype=torch.float32, device="cpu", pin_memory=True)
         if self.is_old_actor_logp_required:
             batch_experience.old_actor_logps = torch.zeros((shape_tensor[0], shape_tensor[1]), dtype=torch.float32, device="cpu", pin_memory=True)
@@ -775,6 +807,7 @@ class GRPOTrainer:
         input_ids = dist_utils._sync_2D_input_data(input_ids, torch.int64, shape_tensor)
         labels = dist_utils._sync_2D_input_data(labels, torch.int64, shape_tensor)
         loss_mask = dist_utils._sync_2D_input_data(loss_mask, torch.float32, shape_tensor)
+        teacher_logps = dist_utils._sync_2D_input_data(teacher_logps, torch.float32, shape_tensor)
         outcome_rewards = dist_utils._sync_2D_input_data(
             outcome_rewards.unsqueeze(dim=0) if outcome_rewards is not None else None, 
             torch.float32, torch.LongTensor([1, shape_tensor[0]])
@@ -785,6 +818,8 @@ class GRPOTrainer:
             batch_experience.labels.copy_(labels, non_blocking=True)
         with torch.cuda.stream(self.s2):
             batch_experience.loss_mask.copy_(loss_mask, non_blocking=True)
+            if batch_experience.teacher_logps is not None:
+                batch_experience.teacher_logps.copy_(teacher_logps, non_blocking=True)
             batch_experience.outcome_rewards.copy_(outcome_rewards, non_blocking=True)
         self.s1.synchronize()
         self.s2.synchronize()
@@ -804,13 +839,48 @@ class GRPOTrainer:
                 self._build_legacy_messages(prompt, response)
                 for response in responses
             ]
+            group_content_ids = sample.group_content_ids or []
+            group_loss_mask = sample.group_loss_mask or []
+            group_teacher_log_probs = sample.group_teacher_log_probs or []
             completion_tokens = sample.completion_tokens
             reward_metrics_list = sample.reward_metrics_list or []
             sample_id = sample.sample_id
+
+            use_teacher_logps = any(
+                item is not None
+                for item in (sample.group_content_ids, sample.group_loss_mask, sample.group_teacher_log_probs)
+            )
+            if use_teacher_logps:
+                expected = len(responses)
+                if not (
+                    len(group_content_ids) == expected
+                    and len(group_loss_mask) == expected
+                    and len(group_teacher_log_probs) == expected
+                ):
+                    raise ValueError(
+                        f"teacher distillation fields length mismatch for sample_id={sample_id}: "
+                        f"responses={expected}, content_ids={len(group_content_ids)}, "
+                        f"loss_mask={len(group_loss_mask)}, teacher_log_probs={len(group_teacher_log_probs)}"
+                    )
             all_samples += [
-                Sample(prompt=prompt, response=response, messages=messages, reward=reward, normed_reward=normed_reward, reward_metrics=reward_metrics, \
-                       completion_tokens=completion_tokens / len(responses), ground_truth=sample.ground_truth, dataset_type=sample.dataset_type, sample_id=sample_id)
-                for response, messages, reward, normed_reward, reward_metrics in zip(responses, group_messages, rewards, normed_rewards, reward_metrics_list)
+                Sample(
+                    prompt=prompt,
+                    response=response,
+                    messages=messages,
+                    content_ids=(group_content_ids[idx] if use_teacher_logps else None),
+                    loss_mask=(group_loss_mask[idx] if use_teacher_logps else None),
+                    teacher_log_probs=(group_teacher_log_probs[idx] if use_teacher_logps else None),
+                    reward=reward,
+                    normed_reward=normed_reward,
+                    reward_metrics=reward_metrics,
+                    completion_tokens=completion_tokens / len(responses),
+                    ground_truth=sample.ground_truth,
+                    dataset_type=sample.dataset_type,
+                    sample_id=sample_id,
+                )
+                for idx, (response, messages, reward, normed_reward, reward_metrics) in enumerate(
+                    zip(responses, group_messages, rewards, normed_rewards, reward_metrics_list)
+                )
             ]
         random.shuffle(all_samples)
         return all_samples
@@ -825,16 +895,33 @@ class GRPOTrainer:
         self.logger.debug(f"drop {len(raw_samples) - len(samples)} samples")
         assert len(samples) > 0
         outcome_rewards = torch.tensor([s.normed_reward for s in samples], dtype=torch.float32, device=dist_utils.get_device())
+        use_teacher_logps = [self._sample_uses_teacher_logps(sample) for sample in samples]
+        if any(use_teacher_logps) and not all(use_teacher_logps):
+            raise ValueError("collate_fn_optimized 当前不支持 teacher OPD 样本与普通 PPO 样本混跑")
+        use_opd_path = all(use_teacher_logps)
 
         batch_input_ids_list = []
         batch_loss_mask_list = []
+        batch_teacher_logps_list = [] if use_opd_path else None
 
         for sample in samples:
-            if sample.messages is None:
-                raise ValueError("Sample.messages must be populated before collation")
-            input_ids, loss_mask = self._messages_to_token_ids_and_loss_mask(sample.messages)
-            batch_input_ids_list.append(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)) # 先转tensor，方便pad_sequence
-            batch_loss_mask_list.append(torch.tensor(loss_mask, dtype=torch.float32, pin_memory=True))
+            if use_opd_path:
+                if sample.content_ids is None or sample.loss_mask is None or sample.teacher_log_probs is None:
+                    raise ValueError("OPD 样本缺少 content_ids/loss_mask/teacher_log_probs")
+                input_ids = np.asarray(sample.content_ids)
+                loss_mask = np.asarray(sample.loss_mask)
+                teacher_logps = np.asarray(sample.teacher_log_probs)
+                if not (len(input_ids) == len(loss_mask) == len(teacher_logps)):
+                    raise ValueError("OPD 样本的 content_ids/loss_mask/teacher_log_probs 长度不一致")
+                batch_input_ids_list.append(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
+                batch_loss_mask_list.append(torch.tensor(loss_mask, dtype=torch.float32, pin_memory=True))
+                batch_teacher_logps_list.append(torch.tensor(teacher_logps, dtype=torch.float32, pin_memory=True))
+            else:
+                if sample.messages is None:
+                    raise ValueError("Sample.messages must be populated before collation")
+                input_ids, loss_mask = self._messages_to_token_ids_and_loss_mask(sample.messages)
+                batch_input_ids_list.append(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)) # 先转tensor，方便pad_sequence
+                batch_loss_mask_list.append(torch.tensor(loss_mask, dtype=torch.float32, pin_memory=True))
         
         if self.args.pad_to_max_length:
             max_len_for_padding = self.args.seq_length + 1
@@ -848,12 +935,15 @@ class GRPOTrainer:
 
         processed_input_ids = []
         processed_loss_masks = []
+        processed_teacher_logps = [] if use_opd_path else None
 
-        for ids, mask in zip(batch_input_ids_list, batch_loss_mask_list):
+        for idx, (ids, mask) in enumerate(zip(batch_input_ids_list, batch_loss_mask_list)):
             ids = ids[:max_len_for_padding]
             mask = mask[:max_len_for_padding]
             processed_input_ids.append(ids)
             processed_loss_masks.append(mask)
+            if use_opd_path:
+                processed_teacher_logps.append(batch_teacher_logps_list[idx][:max_len_for_padding])
         
         padded_input_ids_tensor = torch.nn.utils.rnn.pad_sequence(
             processed_input_ids,
@@ -866,6 +956,14 @@ class GRPOTrainer:
             batch_first=True,
             padding_value=0  # loss_mask 用0填充
         ).to(dist_utils.get_device(), non_blocking=True)
+        if use_opd_path:
+            padded_teacher_logps_tensor = torch.nn.utils.rnn.pad_sequence(
+                processed_teacher_logps,
+                batch_first=True,
+                padding_value=0.0
+            ).to(dist_utils.get_device(), non_blocking=True)
+        else:
+            padded_teacher_logps_tensor = None
 
         current_padded_len = padded_input_ids_tensor.shape[1]
 
@@ -880,15 +978,25 @@ class GRPOTrainer:
 
             padded_input_ids_tensor = torch.cat([padded_input_ids_tensor, pad_tensor_ids], dim=1)
             padded_loss_mask_tensor = torch.cat([padded_loss_mask_tensor, pad_tensor_mask], dim=1)
+            if use_opd_path:
+                pad_tensor_teacher = torch.full(
+                    (padded_teacher_logps_tensor.size(0), padding_needed),
+                    0.0,
+                    dtype=torch.float32,
+                    device=dist_utils.get_device(),
+                )
+                padded_teacher_logps_tensor = torch.cat([padded_teacher_logps_tensor, pad_tensor_teacher], dim=1)
         
         final_input_ids = padded_input_ids_tensor[:, :-1].contiguous()
         final_labels = padded_input_ids_tensor[:, 1:].contiguous()
         final_loss_mask = padded_loss_mask_tensor[:, 1:].contiguous()
+        final_teacher_logps = None if padded_teacher_logps_tensor is None else padded_teacher_logps_tensor[:, 1:].contiguous()
 
         return BatchExperience(
             input_ids=final_input_ids,
             labels=final_labels,
             loss_mask=final_loss_mask,
+            teacher_logps=final_teacher_logps,
             outcome_rewards=outcome_rewards,
             batch_samples=samples
         )
@@ -1311,6 +1419,49 @@ class GRPOTrainer:
 
             return loss, {"losses": losses_reduced}
 
+        def opd_loss_func(
+            output_tensor: torch.Tensor,
+            labels: torch.Tensor,
+            loss_mask: torch.Tensor,
+            teacher_logps: torch.Tensor,
+            non_loss_data: bool = False,
+        ):
+            assert non_loss_data == False
+            student_logps = from_parallel_logits_to_logprobs(output_tensor, labels, higher_stability=True, ignore_last=False)
+            with torch.no_grad():
+                advantages = teacher_logps - student_logps.detach()
+
+            logp_diff = student_logps - student_logps.detach()
+            ratio = logp_diff.exp()
+            surr1 = ratio * advantages
+            surr2 = ratio.clamp(1 - self.args.clip_eps, 1 + self.args.clip_eps) * advantages
+            actor_loss = -torch.min(surr1, surr2)
+            actor_loss = masked_mean(actor_loss, loss_mask, dim=-1)
+            if mpu.get_context_parallel_world_size() > 1:
+                dist.all_reduce(actor_loss, op=ReduceOp.AVG, group=mpu.get_context_parallel_group())
+            policy_loss = actor_loss.mean()
+
+            entropy_loss = None
+            if self.args.entropy_loss_coef > -1:
+                unmasked_entropy_loss = vocab_parallel_entropy(output_tensor)
+                entropy_loss = masked_mean(unmasked_entropy_loss, loss_mask, dim=-1)
+                if mpu.get_context_parallel_world_size() > 1:
+                    dist.all_reduce(entropy_loss, op=ReduceOp.AVG, group=mpu.get_context_parallel_group())
+                entropy_loss = entropy_loss.mean()
+
+            loss = self.args.policy_loss_coef * policy_loss
+            losses_reduced = torch.cat(
+                [
+                    loss.clone().detach().unsqueeze(dim=0),
+                    policy_loss.clone().detach().unsqueeze(dim=0),
+                    torch.tensor(0.0, dtype=torch.float32, device=dist_utils.get_device()).unsqueeze(dim=0),
+                    entropy_loss.clone().detach().unsqueeze(dim=0) if entropy_loss is not None else \
+                        torch.tensor(0.0, dtype=torch.float32, device=dist_utils.get_device()).unsqueeze(dim=0),
+                ], dim=0
+            )
+            dist.all_reduce(losses_reduced, op=ReduceOp.AVG, group=mpu.get_data_parallel_group())
+            return loss, {"losses": losses_reduced}
+
         def megatron_forward_step(data_iterator, model):
             forward_args = {
                 "input_ids": None,
@@ -1322,10 +1473,12 @@ class GRPOTrainer:
                 "old_actor_logps": None,
                 "ref_logps": None,
                 "advantages": None,
+                "teacher_logps": None,
                 "loss_mask": None,
                 "outcome_rewards": None,
                 "debug_i": None
             }
+            selected_loss_func = loss_func
             if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
                 assert data_iterator is not None
                 batched_item: Dict[str, torch.Tensor] = next(data_iterator)
@@ -1335,13 +1488,17 @@ class GRPOTrainer:
                     loss_func_args["labels"] = batched_item["labels"].to(device=dist_utils.get_device(), non_blocking=True)
                     loss_func_args["loss_mask"] = batched_item["loss_mask"].to(device=dist_utils.get_device(), non_blocking=True)
                     loss_func_args["debug_i"] = batched_item["idx"]
-                    loss_func_args["outcome_rewards"] = batched_item["outcome_rewards"].to(device=dist_utils.get_device(), non_blocking=True)
-                    if self.is_old_actor_logp_required:
-                        loss_func_args["old_actor_logps"] = batched_item["old_actor_logps"].to(device=dist_utils.get_device(), non_blocking=True)
-                    if not self.args.use_outcome_rewards_as_advantages:
-                        loss_func_args["advantages"] = batched_item["advantages"].to(device=dist_utils.get_device(), non_blocking=True)
-                    if self.args.init_kl_coef > 1e-8:
-                        loss_func_args["ref_logps"] = batched_item["ref_logps"].to(device=dist_utils.get_device(), non_blocking=True)
+                    if batched_item.get("teacher_logps") is not None:
+                        selected_loss_func = opd_loss_func
+                        loss_func_args["teacher_logps"] = batched_item["teacher_logps"].to(device=dist_utils.get_device(), non_blocking=True)
+                    else:
+                        loss_func_args["outcome_rewards"] = batched_item["outcome_rewards"].to(device=dist_utils.get_device(), non_blocking=True)
+                        if self.is_old_actor_logp_required:
+                            loss_func_args["old_actor_logps"] = batched_item["old_actor_logps"].to(device=dist_utils.get_device(), non_blocking=True)
+                        if not self.args.use_outcome_rewards_as_advantages:
+                            loss_func_args["advantages"] = batched_item["advantages"].to(device=dist_utils.get_device(), non_blocking=True)
+                        if self.args.init_kl_coef > 1e-8:
+                            loss_func_args["ref_logps"] = batched_item["ref_logps"].to(device=dist_utils.get_device(), non_blocking=True)
 
                 if int(os.environ.get("LIGHT_SCALE_DUMP_FLAG", os.environ.get("MRL_DUMP_FLAG", 0))) == 1 and mpu.get_tensor_model_parallel_rank() == 0:
                     # for debug
@@ -1357,7 +1514,7 @@ class GRPOTrainer:
 
             output_tensor = model(**forward_args)
 
-            return output_tensor, partial(loss_func, **loss_func_args)
+            return output_tensor, partial(selected_loss_func, **loss_func_args)
 
         reduced_losses = get_forward_backward_func()(
             forward_step_func=megatron_forward_step,
