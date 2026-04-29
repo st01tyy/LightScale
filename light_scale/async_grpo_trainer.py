@@ -95,6 +95,11 @@ class GRPOTrainer:
     AVG_METRICS = ['reward', 'completion_tokens', 'total_tokens']
 
     @staticmethod
+    def _to_pinned_cpu_tensor(data, dtype: torch.dtype) -> torch.Tensor:
+        tensor = torch.as_tensor(data, dtype=dtype)
+        return tensor.pin_memory()
+
+    @staticmethod
     def _build_legacy_messages(prompt: str, response: str) -> List[Message]:
         return [
             Message(content=prompt, is_masked=True),
@@ -908,20 +913,20 @@ class GRPOTrainer:
             if use_opd_path:
                 if sample.content_ids is None or sample.loss_mask is None or sample.teacher_log_probs is None:
                     raise ValueError("OPD 样本缺少 content_ids/loss_mask/teacher_log_probs")
-                input_ids = np.asarray(sample.content_ids)
-                loss_mask = np.asarray(sample.loss_mask)
-                teacher_logps = np.asarray(sample.teacher_log_probs)
+                input_ids = sample.content_ids
+                loss_mask = sample.loss_mask
+                teacher_logps = sample.teacher_log_probs
                 if not (len(input_ids) == len(loss_mask) == len(teacher_logps)):
                     raise ValueError("OPD 样本的 content_ids/loss_mask/teacher_log_probs 长度不一致")
-                batch_input_ids_list.append(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
-                batch_loss_mask_list.append(torch.tensor(loss_mask, dtype=torch.float32, pin_memory=True))
-                batch_teacher_logps_list.append(torch.tensor(teacher_logps, dtype=torch.float32, pin_memory=True))
+                batch_input_ids_list.append(self._to_pinned_cpu_tensor(input_ids, dtype=torch.int64))
+                batch_loss_mask_list.append(self._to_pinned_cpu_tensor(loss_mask, dtype=torch.float32))
+                batch_teacher_logps_list.append(self._to_pinned_cpu_tensor(teacher_logps, dtype=torch.float32))
             else:
                 if sample.messages is None:
                     raise ValueError("Sample.messages must be populated before collation")
                 input_ids, loss_mask = self._messages_to_token_ids_and_loss_mask(sample.messages)
-                batch_input_ids_list.append(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)) # 先转tensor，方便pad_sequence
-                batch_loss_mask_list.append(torch.tensor(loss_mask, dtype=torch.float32, pin_memory=True))
+                batch_input_ids_list.append(self._to_pinned_cpu_tensor(input_ids, dtype=torch.int64)) # 先转tensor，方便pad_sequence
+                batch_loss_mask_list.append(self._to_pinned_cpu_tensor(loss_mask, dtype=torch.float32))
         
         if self.args.pad_to_max_length:
             max_len_for_padding = self.args.seq_length + 1
@@ -1468,16 +1473,7 @@ class GRPOTrainer:
                 "position_ids": None,
                 "attention_mask": None
             }
-            loss_func_args = {
-                "labels": None,
-                "old_actor_logps": None,
-                "ref_logps": None,
-                "advantages": None,
-                "teacher_logps": None,
-                "loss_mask": None,
-                "outcome_rewards": None,
-                "debug_i": None
-            }
+            loss_func_args = {}
             selected_loss_func = loss_func
             if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
                 assert data_iterator is not None
@@ -1485,14 +1481,22 @@ class GRPOTrainer:
                 if mpu.is_pipeline_first_stage():
                     forward_args["input_ids"] = batched_item["input_ids"].to(device=dist_utils.get_device(), non_blocking=True)
                 if mpu.is_pipeline_last_stage():
-                    loss_func_args["labels"] = batched_item["labels"].to(device=dist_utils.get_device(), non_blocking=True)
-                    loss_func_args["loss_mask"] = batched_item["loss_mask"].to(device=dist_utils.get_device(), non_blocking=True)
-                    loss_func_args["debug_i"] = batched_item["idx"]
+                    labels = batched_item["labels"].to(device=dist_utils.get_device(), non_blocking=True)
+                    loss_mask = batched_item["loss_mask"].to(device=dist_utils.get_device(), non_blocking=True)
                     if batched_item.get("teacher_logps") is not None:
                         selected_loss_func = opd_loss_func
-                        loss_func_args["teacher_logps"] = batched_item["teacher_logps"].to(device=dist_utils.get_device(), non_blocking=True)
+                        loss_func_args = {
+                            "labels": labels,
+                            "loss_mask": loss_mask,
+                            "teacher_logps": batched_item["teacher_logps"].to(device=dist_utils.get_device(), non_blocking=True),
+                        }
                     else:
-                        loss_func_args["outcome_rewards"] = batched_item["outcome_rewards"].to(device=dist_utils.get_device(), non_blocking=True)
+                        loss_func_args = {
+                            "labels": labels,
+                            "loss_mask": loss_mask,
+                            "debug_i": batched_item["idx"],
+                            "outcome_rewards": batched_item["outcome_rewards"].to(device=dist_utils.get_device(), non_blocking=True),
+                        }
                         if self.is_old_actor_logp_required:
                             loss_func_args["old_actor_logps"] = batched_item["old_actor_logps"].to(device=dist_utils.get_device(), non_blocking=True)
                         if not self.args.use_outcome_rewards_as_advantages:

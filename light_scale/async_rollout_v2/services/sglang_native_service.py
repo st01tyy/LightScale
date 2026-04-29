@@ -41,7 +41,7 @@ class SGLangNativeMetaInfo:
 	prompt_tokens: int
 	completion_tokens: int
 	cached_tokens: int
-	weight_version: Optional[int] = None
+	weight_version: Optional[str] = None
 	total_retractions: Optional[int] = None
 	input_token_logprobs: List[LogprobTuple] = field(default_factory=list)
 	output_token_logprobs: List[LogprobTuple] = field(default_factory=list)
@@ -345,7 +345,7 @@ class AsyncSGLangNativeService(AsyncBaseService):
 			prompt_tokens=prompt_tokens,
 			completion_tokens=self._optional_int(meta_info_data.get("completion_tokens"), default=0),
 			cached_tokens=self._optional_int(meta_info_data.get("cached_tokens"), default=0),
-			weight_version=self._optional_int(meta_info_data.get("weight_version")),
+			weight_version=self._optional_str(meta_info_data.get("weight_version")),
 			total_retractions=self._optional_int(meta_info_data.get("total_retractions")),
 			input_token_logprobs=self._parse_logprob_tuple_list(meta_info_data.get("input_token_logprobs")),
 			output_token_logprobs=self._parse_logprob_tuple_list(meta_info_data.get("output_token_logprobs")),
@@ -432,6 +432,16 @@ class AsyncSGLangNativeService(AsyncBaseService):
 		if not isinstance(value, int):
 			raise RuntimeError(f"Expected int-compatible field, got: {value}")
 		return value
+
+	@staticmethod
+	def _optional_str(value: Any, default: Optional[str] = None) -> Optional[str]:
+		if value is None:
+			return default
+		if isinstance(value, str):
+			return value
+		if isinstance(value, (int, float, bool)):
+			return str(value)
+		raise RuntimeError(f"Expected str-compatible field, got: {value}")
 
 	@staticmethod
 	def _normalize_path(path: str) -> str:

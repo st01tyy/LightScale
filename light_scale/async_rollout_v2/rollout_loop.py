@@ -1,6 +1,7 @@
 """Asyncio main loop for rollout v2."""
 
 import asyncio
+from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Tuple, Type, Optional
 
@@ -22,6 +23,20 @@ class RolloutInitializationError(Exception):
 	pass
 
 
+@dataclass
+class RolloutContext:
+	"""Runtime context built during rollout initialization."""
+
+	name_to_services: Dict[str, AsyncBaseService]
+	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]]
+	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]]
+	data_type_to_teacher_service_name: Dict[str, str]
+	samples: datasets.Dataset
+
+	def get_services_to_stop(self) -> List[AsyncBaseService]:
+		return list(self.name_to_services.values())
+
+
 async def run_rollout_loop(
 	rollout_batch_size: int,
 	passed_iters: int,
@@ -35,23 +50,34 @@ async def run_rollout_loop(
 	log_level: int,
 ) -> None:
 	"""asyncio 主循环：按批次并发执行 worker，结果写回输出队列。"""
+	context: Optional[RolloutContext] = None
+	name_to_services: Dict[str, AsyncBaseService] = {}
 	try:
-		(
-			name_to_services,
-			type_to_worker_params,
-			data_type_to_worker_type,
-			samples,
-		) = await _initialize_rollout_context(async_cfg, stop_event, logger, log_level)
-		services_to_stop = list(name_to_services.values())
+		name_to_services = await _initialize_services(
+			async_cfg.get("services") or [], stop_event, logger, log_level
+		)
+		context = await _initialize_rollout_context(
+			async_cfg=async_cfg,
+			logger=logger,
+			name_to_services=name_to_services,
+		)
 		start_event.set()
 		logger.info("Rollout v2 初始化完成，启动主循环。")
 	except RolloutInitializationError as err:
 		logger.error("Rollout 初始化失败: %s", err)
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
+		elif name_to_services:
+			await _stop_services(list(name_to_services.values()), logger)
 		stop_event.set()
 		failed_event.set()
 		return
 	except Exception as err:
 		logger.exception("Rollout 初始化出现未预期异常: %s", err)
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
+		elif name_to_services:
+			await _stop_services(list(name_to_services.values()), logger)
 		stop_event.set()
 		failed_event.set()
 		return
@@ -66,10 +92,7 @@ async def run_rollout_loop(
 		await _run_rollout_loop(
 			rollout_batch_size=rollout_batch_size,
 			passed_iters=passed_iters,
-			samples=samples,
-			name_to_services=name_to_services,
-			type_to_worker_params=type_to_worker_params,
-			data_type_to_worker_type=data_type_to_worker_type,
+			context=context,
 			input_queue=input_queue,
 			output_queue=output_queue,
 			stop_event=stop_event,
@@ -85,7 +108,8 @@ async def run_rollout_loop(
 		logger.exception("Rollout v2 asyncio loop crashed unexpectedly")
 		raise
 	finally:
-		await _stop_services(services_to_stop, logger)
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
 		close_all()
 		if stop_event.is_set():
 			logger.warning("Rollout v2 asyncio loop stopping")
@@ -97,17 +121,9 @@ async def run_rollout_loop(
 
 async def _initialize_rollout_context(
 	async_cfg: Dict[str, Any],
-	stop_event,
 	logger: logging.Logger,
-	log_level: int,
-) -> Tuple[
-	Dict[str, AsyncBaseService],
-	Dict[Type[AsyncBaseWorker], Dict[str, Any]],
-	Dict[str, Type[AsyncBaseWorker]],
-	Dict[str, str],
-	datasets.Dataset,
-]:
-	services_cfg = async_cfg.get("services") or []
+	name_to_services: Dict[str, AsyncBaseService],
+) -> RolloutContext:
 	workers_cfg = async_cfg.get("workers") or []
 	for worker_cfg in workers_cfg:
 		worker_type = worker_cfg.get("type", None)
@@ -115,42 +131,30 @@ async def _initialize_rollout_context(
 			raise RolloutInitializationError("每个 worker 必须包含 type 字段")
 		if worker_type not in WORKER_CLASS_REGISTRY:
 			raise RolloutInitializationError(f"未知的 worker 类型: {worker_type}")
-	for service_cfg in services_cfg:
-		service_type = service_cfg.get("type", None)
-		if service_type is None:
-			raise RolloutInitializationError("每个 service 必须包含 type 字段")
-		if service_type not in SERVICE_CLASS_REGISTRY:
-			raise RolloutInitializationError(f"未知的 service 类型: {service_type}")
-
-	name_to_services = await _initialize_services(services_cfg, stop_event, logger, log_level)
 	(
 		type_to_worker_params,
 		data_type_to_worker_type,
 		) = _prepare_worker_params(workers_cfg, logger, async_cfg.get("llm_judge") or {})
 	data_type_to_teacher_service_name = _build_teacher_service_registry(async_cfg, name_to_services)
-	
+
 	samples = await _load_dataset(async_cfg.get("data"), logger)
 	samples = samples.shuffle(seed=42)
 	_ensure_worker_service_dependencies(type_to_worker_params, name_to_services)
 	_ensure_teacher_registry_dependencies(data_type_to_teacher_service_name, name_to_services)
 	_ensure_data_worker_dependencies(data_type_to_worker_type, samples)
-	return (
-		name_to_services,
-		type_to_worker_params,
-		data_type_to_worker_type,
-		data_type_to_teacher_service_name,
-		samples,
+	return RolloutContext(
+		name_to_services=name_to_services,
+		type_to_worker_params=type_to_worker_params,
+		data_type_to_worker_type=data_type_to_worker_type,
+		data_type_to_teacher_service_name=data_type_to_teacher_service_name,
+		samples=samples,
 	)
 
 
 async def _run_rollout_loop(
 	rollout_batch_size: int,
 	passed_iters: int,
-	samples: datasets.Dataset,
-	name_to_services: Dict[str, AsyncBaseService],
-	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]],
-	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]],
-	data_type_to_teacher_service_name: Dict[str, str],
+	context: RolloutContext,
 	input_queue,
 	output_queue,
 	stop_event,
@@ -158,7 +162,7 @@ async def _run_rollout_loop(
 	log_level: int,
 ) -> None:
 	thread_pool_size = rollout_batch_size
-	total_samples = len(samples)
+	total_samples = len(context.samples)
 	if total_samples == 0:
 		raise RolloutInitializationError("数据集为空，无法执行 rollout")
 	cursor = (rollout_batch_size * passed_iters) % total_samples
@@ -179,15 +183,12 @@ async def _run_rollout_loop(
 		while len(batch_ids) < rollout_batch_size:
 			batch_ids.append(cursor)
 			cursor = (cursor + 1) % total_samples
-		batch_samples = samples.select(batch_ids)
+		batch_samples = context.samples.select(batch_ids)
 
 		logger.info("Rollout step %s started", passed_iters_value)
 		await _execute_batch(
 			batch_samples=batch_samples,
-			data_type_to_worker_type=data_type_to_worker_type,
-			type_to_worker_params=type_to_worker_params,
-			data_type_to_teacher_service_name=data_type_to_teacher_service_name,
-			name_to_services=name_to_services,
+			context=context,
 			stop_event=stop_event,
 			output_queue=output_queue,
 			logger=logger,
@@ -197,10 +198,7 @@ async def _run_rollout_loop(
 
 async def _execute_batch(
 	batch_samples: datasets.Dataset,
-	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]],
-	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]],
-	data_type_to_teacher_service_name: Dict[str, str],
-	name_to_services: Dict[str, AsyncBaseService],
+	context: RolloutContext,
 	stop_event,
 	output_queue,
 	logger: logging.Logger,
@@ -214,13 +212,13 @@ async def _execute_batch(
 		if stop_event.is_set():
 			break
 		dataset_type = sample["dataset_type"]
-		worker_cls = data_type_to_worker_type[dataset_type]
-		worker_params = type_to_worker_params.get(worker_cls, dict())
-		teacher_service_name = data_type_to_teacher_service_name.get(dataset_type)
+		worker_cls = context.data_type_to_worker_type[dataset_type]
+		worker_params = context.type_to_worker_params.get(worker_cls, dict())
+		teacher_service_name = context.data_type_to_teacher_service_name.get(dataset_type)
 		try:
 			worker = worker_cls(
 				input_data=sample,
-				service_dict=name_to_services,
+				service_dict=context.name_to_services,
 				stop_event=stop_event,
 				log_level=log_level,
 				teacher_service_name=teacher_service_name,

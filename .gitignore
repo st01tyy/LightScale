@@ -21,6 +21,7 @@ training_outputs*/
 hostfile.txt
 trash_bin/
 debug_mrl/
+debug/
 examples_jiutian/sandbox_fusion_hostfile.txt
 
 run.log
