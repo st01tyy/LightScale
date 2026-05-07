@@ -409,13 +409,21 @@ class GRPOTrainer:
     def _get_actor_rollout_config(self):
         with open(self.args.async_rollout_cfg_path) as f:
             async_rollout_cfg = yaml.safe_load(f)
-        actor_service_name = async_rollout_cfg["actor_service_name"]
-        resources = None
-        for service in async_rollout_cfg["services"]:
-            if service["name"] == actor_service_name:
-                resources = service["resources"]
-                break
-        assert resources is not None, f"Cannot find actor service config for {actor_service_name}"
+        actor_service_names = async_rollout_cfg["actor_service_names"]
+        assert isinstance(actor_service_names, list) and len(actor_service_names) > 0, (
+            "resolved async_rollout config must contain a non-empty actor_service_names list"
+        )
+
+        service_by_name = {service["name"]: service for service in async_rollout_cfg["services"]}
+        resources = []
+        for actor_service_name in actor_service_names:
+            service = service_by_name.get(actor_service_name)
+            assert service is not None, f"Cannot find actor service config for {actor_service_name}"
+            service_resources = service.get("resources")
+            assert service_resources is not None, f"Actor service {actor_service_name} is missing resources"
+            resources.extend(service_resources)
+
+        assert len(resources) > 0, f"Cannot find any actor resources for {actor_service_names}"
         base_url_list = [resource["base_url"] for resource in resources]
         world_size = sum(resource["num_gpus"] for resource in resources)
         return base_url_list, world_size

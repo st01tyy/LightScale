@@ -218,8 +218,8 @@ def _build_initial_gpu_slots(
     # whole_node_pool: [0, 3, 4, ...]
     return gpu_slots, whole_node_pool
 
-def _make_sure_service_names_unique_and_valid(services_cfg: List[Dict[str, Any]], actor_service_name: str) -> None:
-    # 检查各service name没有重复，且actor_service_name存在
+def _make_sure_service_names_unique_and_valid(services_cfg: List[Dict[str, Any]]) -> None:
+    # 检查各 service name 没有重复
     service_names = set()
     for service_cfg in services_cfg:
         name = service_cfg.get("name", None)
@@ -228,8 +228,41 @@ def _make_sure_service_names_unique_and_valid(services_cfg: List[Dict[str, Any]]
         if name in service_names:
             raise ValueError(f"发现重复的 service name: {name}")
         service_names.add(name)
-    if actor_service_name not in service_names:
-        raise ValueError(f"actor_service_name '{actor_service_name}' 不在 services 配置中")
+
+
+def _normalize_actor_service_names(async_cfg: Dict[str, Any]) -> List[str]:
+    actor_service_names = async_cfg.get("actor_service_names")
+    if actor_service_names is None:
+        legacy_actor_service_name = async_cfg.get("actor_service_name")
+        if legacy_actor_service_name is None:
+            raise ValueError("async_rollout 配置中缺少 actor_service_names 字段")
+        actor_service_names = [legacy_actor_service_name]
+
+    if not isinstance(actor_service_names, list) or len(actor_service_names) == 0:
+        raise ValueError("actor_service_names 必须是非空列表")
+
+    normalized_names: List[str] = []
+    seen_names = set()
+    for service_name in actor_service_names:
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError("actor_service_names 中的元素必须是非空字符串")
+        if service_name in seen_names:
+            raise ValueError(f"actor_service_names 中存在重复 service: {service_name}")
+        seen_names.add(service_name)
+        normalized_names.append(service_name)
+
+    async_cfg["actor_service_names"] = normalized_names
+    async_cfg.pop("actor_service_name", None)
+    return normalized_names
+
+
+def _make_sure_actor_service_names_valid(
+    services_cfg: List[Dict[str, Any]], actor_service_names: List[str]
+) -> None:
+    service_names = {service_cfg.get("name") for service_cfg in services_cfg}
+    for actor_service_name in actor_service_names:
+        if actor_service_name not in service_names:
+            raise ValueError(f"actor_service_names 中的 service '{actor_service_name}' 不在 services 配置中")
 
 
 def _validate_teacher_models_registry(async_cfg: Dict[str, Any]) -> None:
@@ -327,8 +360,9 @@ def _allocate_async_services(
     services_cfg: List[Dict[str, Any]] = async_cfg["services"]
     assert type(services_cfg) == list, "services 字段必须是列表"
     assert len(services_cfg) > 0, "services 列表不能为空，至少有一个actor模型推理服务"
-    assert "actor_service_name" in async_cfg, "async_rollout 配置中缺少 actor_service_name 字段"
-    _make_sure_service_names_unique_and_valid(services_cfg, async_cfg["actor_service_name"])
+    actor_service_names = _normalize_actor_service_names(async_cfg)
+    _make_sure_service_names_unique_and_valid(services_cfg)
+    _make_sure_actor_service_names_valid(services_cfg, actor_service_names)
     _validate_teacher_models_registry(async_cfg)
 
     cpu_node_cursor = 0
@@ -619,6 +653,7 @@ def emit_resolved_async_config(
     # 合并 external_services 与 HQ 规划的实例
     async_cfg = config['async_rollout']
     async_cfg = copy.deepcopy(async_cfg)
+    _normalize_actor_service_names(async_cfg)
     services_cfg: List[Dict[str, Any]] = async_cfg['services']
     # actor_service_name = async_cfg['actor_service_name']
     # resolved_services = []

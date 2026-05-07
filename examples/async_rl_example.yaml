@@ -94,7 +94,8 @@ distillation:
     seq_kd: False # whether to use sequence-level kd
 async_rollout:
   data: '' # 数据集路径
-  actor_service_name: actor_model # actor模型服务名称
+  actor_service_names: # actor模型服务名称列表
+    - actor_model
   teacher_models_registry: null
   services:
     - type: sglang

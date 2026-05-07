@@ -87,7 +87,8 @@ distillation:
     seq_kd: false
 async_rollout:
   data: '' # 数据集路径
-  actor_service_name: actor_model
+  actor_service_names:
+    - actor_model
   teacher_models_registry:
     - service_name: teacher_model
       data_type: ['math', 'deepscaler'] # 命中这些 data_type 时，worker 会请求 teacher_model 返回 prompt logprobs
