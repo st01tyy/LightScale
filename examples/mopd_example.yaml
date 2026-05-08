@@ -89,6 +89,7 @@ async_rollout:
   data: '' # 数据集路径
   actor_service_names:
     - actor_model
+  student_service_name: null # 可选；student native service 名称，需指向 sglang_native 服务
   teacher_models_registry:
     - service_name: teacher_model
       data_type: ['math', 'deepscaler'] # 命中这些 data_type 时，worker 会请求 teacher_model 返回 prompt logprobs
@@ -146,6 +147,7 @@ async_rollout:
         n_samples: 8
         max_tokens: 2048
         advantage_estimator: grpo
+        opd_overlap_topk: 16
         stop_token: '<|endoftext|>'
         add_stop_token: true
         tokenizer_path: '' # 必填；teacher mode 下 rollout worker 用它把消息编码成 content_ids/loss_mask

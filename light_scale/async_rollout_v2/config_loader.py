@@ -40,6 +40,9 @@ def get_async_rollout_config(config: Dict[str, Any]) -> Dict[str, Any]:
 	teacher_models_registry = async_cfg.get("teacher_models_registry")
 	if teacher_models_registry is not None and not isinstance(teacher_models_registry, list):
 		raise RolloutInitializationError("async_rollout.teacher_models_registry 必须为列表或 null")
+	student_service_name = async_cfg.get("student_service_name")
+	if student_service_name is not None and (not isinstance(student_service_name, str) or not student_service_name):
+		raise RolloutInitializationError("async_rollout.student_service_name 必须为非空字符串或 null")
 	for service_cfg in services_cfg:
 		if service_cfg.get("name") is None or service_cfg.get("type") is None:
 			raise RolloutInitializationError("每个 service 必须包含 type 与 name")

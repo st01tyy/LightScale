@@ -96,6 +96,7 @@ async_rollout:
   data: '' # 数据集路径
   actor_service_names: # actor模型服务名称列表
     - actor_model
+  student_service_name: null # 可选；student native service 名称，需指向 sglang_native 服务
   teacher_models_registry: null
   services:
     - type: sglang

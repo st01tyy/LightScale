@@ -51,6 +51,7 @@ class AsyncLLMJudgeWorker(AsyncSingleTurnWorker):
         service_dict: Dict[str, AsyncBaseService],
         stop_event,
         log_level: int,
+		student_service_name: Optional[str] = None,
 		teacher_service_name: Optional[str] = None,
         **worker_cfg,
     ):
@@ -59,6 +60,7 @@ class AsyncLLMJudgeWorker(AsyncSingleTurnWorker):
             service_dict=service_dict,
             stop_event=stop_event,
             log_level=log_level,
+			student_service_name=student_service_name,
 			teacher_service_name=teacher_service_name,
             **worker_cfg,
         )

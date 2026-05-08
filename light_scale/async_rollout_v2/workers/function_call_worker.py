@@ -77,6 +77,7 @@ class AsyncFunctionCallWorker(AsyncBaseWorker):
         service_dict: Dict[str, AsyncBaseService],
         stop_event,
         log_level: int,
+        student_service_name: Optional[str] = None,
         teacher_service_name: Optional[str] = None,
         **worker_cfg,
     ):
@@ -85,6 +86,7 @@ class AsyncFunctionCallWorker(AsyncBaseWorker):
             service_dict=service_dict,
             stop_event=stop_event,
             log_level=log_level,
+            student_service_name=student_service_name,
             teacher_service_name=teacher_service_name,
         )
         self._config = self.CONFIG_CLS(**worker_cfg)
