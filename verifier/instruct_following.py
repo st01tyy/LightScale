@@ -5,24 +5,27 @@ import string
 from verifier.if_utils import IF_FUNCTIONS_MAP
 
 
-def verify_ifeval_sample(model_output, constraint):
+def verify(model_output, constraint):
     if isinstance(constraint, str):
         constraint = json.loads(constraint)
     if "func_name" not in constraint:
         print("WARNING: constraint missing func_name")
         print(constraint)
         return False
-    # first, parse out the constraint string.
-    func_name = constraint.pop("func_name")
-    # get the function
+    func_name = constraint["func_name"]
     func = IF_FUNCTIONS_MAP[func_name]
-    # now, run the function
-    # pop out any none args
-    non_none_args = {k: v for k, v in constraint.items() if v is not None}
-    # sometimes we have extra args, sometimes not.
-    if len(constraint) == 0:
+    non_none_args = {
+        key: value
+        for key, value in constraint.items()
+        if key != "func_name" and value is not None
+    }
+    if not non_none_args:
         return func(model_output)
     return func(model_output, **non_none_args)
+
+
+def verify_ifeval_sample(model_output, constraint):
+    return verify(model_output, constraint)
 
 
 def normalize_answer(s):
