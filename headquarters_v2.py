@@ -941,7 +941,9 @@ def generate_eval_cmd(config: dict) -> str:
     assert output_dir, "eval 模式必须指定 output_dir"
     output_dir = os.path.abspath(output_dir)
     dump_path = os.path.join(output_dir, "eval_results")
+    log_dir = os.path.join(output_dir, "eval_log")
     os.makedirs(dump_path, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     eval_cfg = config.get("eval", {}) or {}
     cmd = [
@@ -949,6 +951,7 @@ def generate_eval_cmd(config: dict) -> str:
         f"--async_rollout_cfg_path {os.path.join(output_dir, 'resolved_async_rollout.yaml')}",
         f"--rollout_batch_size {config['training']['rollout_batch_size']}",
         f"--dump_path {dump_path}",
+        f"--log_file_path {os.path.join(log_dir, 'rank_0.log')}",
         f"--n_samples {config['training']['n_samples']}",
         f"--passed_iters {eval_cfg.get('passed_iters', 0)}",
         f"--light_scale_log_level {config['training']['log_level']}",

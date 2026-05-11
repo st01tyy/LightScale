@@ -22,6 +22,7 @@ class EvaluatorConfig:
     async_rollout_cfg_path: str
     rollout_batch_size: int
     dump_path: str
+    log_file_path: Optional[str] = None
     n_samples: int = 1
     passed_iters: int = 0
     light_scale_log_level: str = "info"
@@ -45,7 +46,12 @@ class Evaluator:
 
         self.config = config
         log_level = getattr(logging, str(config.light_scale_log_level).upper(), logging.INFO)
-        self.logger = setup_logger_v2_main_process("light_scale.eval", setup_distributed=False, level=log_level)
+        self.logger = setup_logger_v2_main_process(
+            "light_scale.eval",
+            setup_distributed=False,
+            level=log_level,
+            log_file_path=config.log_file_path,
+        )
         self.log_level = log_level
 
         os.makedirs(self.config.dump_path, exist_ok=True)
@@ -137,6 +143,7 @@ class Evaluator:
                 continue
             if not isinstance(sample, MultiResponseSample):
                 raise TypeError(f"unexpected rollout output type: {type(sample)}")
+            self.logger.info("eval sample received: sample_id=%s, reward=%s", sample.sample_id, sample.rewards)
             if sample.is_end_of_rollout():
                 return self._build_summary(rollout_step, time.time() - start_time)
             self._persist_sample(sample)

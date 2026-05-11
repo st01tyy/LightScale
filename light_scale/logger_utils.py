@@ -1,4 +1,5 @@
 import logging
+import os
 from importlib import import_module
 from logging.handlers import QueueHandler, QueueListener
 from typing import Optional
@@ -119,7 +120,12 @@ def setup_logger(name: str = None, setup_distributed: bool = True, level=logging
 
     return logger
 
-def setup_logger_v2_main_process(name: str = None, setup_distributed: bool = True, level=logging.INFO):
+def setup_logger_v2_main_process(
+    name: str = None,
+    setup_distributed: bool = True,
+    level=logging.INFO,
+    log_file_path: Optional[str] = None,
+):
     global _LOGGING_QUEUE, _LOGGING_LISTENER
     if name is None:
         name = __name__
@@ -139,9 +145,17 @@ def setup_logger_v2_main_process(name: str = None, setup_distributed: bool = Tru
     if _LOGGING_LISTENER is None:
         plain_handler = _PlainStreamHandler()
         plain_handler.setLevel(level)
+        handlers = [plain_handler]
+        if log_file_path:
+            log_dir = os.path.dirname(log_file_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+            file_handler.setLevel(level)
+            handlers.append(file_handler)
         listener = QueueListener(
             _LOGGING_QUEUE,
-            plain_handler,
+            *handlers,
             respect_handler_level=True,
         )
         listener.start()

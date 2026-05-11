@@ -7,6 +7,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async_rollout_cfg_path", type=str, required=True)
     parser.add_argument("--rollout_batch_size", type=int, required=True)
     parser.add_argument("--dump_path", type=str, required=True)
+    parser.add_argument("--log_file_path", type=str, default=None)
     parser.add_argument("--n_samples", type=int, default=1)
     parser.add_argument("--passed_iters", type=int, default=0)
     parser.add_argument("--light_scale_log_level", type=str, default="info")
@@ -21,6 +22,7 @@ def main() -> None:
         async_rollout_cfg_path=args.async_rollout_cfg_path,
         rollout_batch_size=args.rollout_batch_size,
         dump_path=args.dump_path,
+        log_file_path=args.log_file_path,
         n_samples=args.n_samples,
         passed_iters=args.passed_iters,
         light_scale_log_level=args.light_scale_log_level,

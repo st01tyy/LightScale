@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
 from light_scale.async_rollout_v2.executors import get_process_pool
