@@ -1,9 +1,8 @@
 import logging
+from importlib import import_module
 from logging.handlers import QueueHandler, QueueListener
 from typing import Optional
 
-import torch.distributed as dist
-from megatron.core import mpu
 import multiprocessing as mp
 
 
@@ -52,47 +51,62 @@ class DistributedFormatter(logging.Formatter):
         record.cp = self.cp_rank
         record.dp = self.dp_rank
         return super().format(record)
-    
-def _build_formatter(setup_distributed: bool) -> DistributedFormatter:
-    if setup_distributed:
-        assert dist.is_initialized() and mpu.is_initialized()
-        fmt = '[%(asctime)s] [%(process)d] [TP%(tp)d CP%(cp)d PP%(pp)d DP%(dp)d] [%(levelname)s] %(message)s'
-        return DistributedFormatter(
-            fmt,
-            datefmt='%Y/%m/%d %H:%M:%S',
-            tp_rank=mpu.get_tensor_model_parallel_rank(),
-            pp_rank=mpu.get_pipeline_model_parallel_rank(),
-            cp_rank=mpu.get_context_parallel_rank(),
-            dp_rank=mpu.get_data_parallel_rank(),
+
+
+def _get_distributed_context():
+    try:
+        dist = import_module("torch.distributed")
+    except ImportError as err:
+        raise RuntimeError(
+            "distributed logging requested but torch.distributed is unavailable"
+        ) from err
+
+    try:
+        mpu = import_module("megatron.core").mpu
+    except ImportError as err:
+        raise RuntimeError(
+            "distributed logging requested but megatron.core.mpu is unavailable"
+        ) from err
+
+    if not dist.is_initialized() or not mpu.is_initialized():
+        raise RuntimeError(
+            "distributed logging requested before torch.distributed and megatron mpu are initialized"
         )
+
+    return dist, mpu
+
+
+def _build_plain_formatter() -> DistributedFormatter:
     fmt = '[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s'
     return DistributedFormatter(
         fmt,
         datefmt='%Y/%m/%d %H:%M:%S',
     )
 
+
+def _build_distributed_formatter() -> DistributedFormatter:
+    _, mpu = _get_distributed_context()
+    fmt = '[%(asctime)s] [%(process)d] [TP%(tp)d CP%(cp)d PP%(pp)d DP%(dp)d] [%(levelname)s] %(message)s'
+    return DistributedFormatter(
+        fmt,
+        datefmt='%Y/%m/%d %H:%M:%S',
+        tp_rank=mpu.get_tensor_model_parallel_rank(),
+        pp_rank=mpu.get_pipeline_model_parallel_rank(),
+        cp_rank=mpu.get_context_parallel_rank(),
+        dp_rank=mpu.get_data_parallel_rank(),
+    )
+    
+def _build_formatter(setup_distributed: bool) -> DistributedFormatter:
+    if setup_distributed:
+        return _build_distributed_formatter()
+    return _build_plain_formatter()
+
 def setup_logger(name: str = None, setup_distributed: bool = True, level=logging.INFO):
     if name is None:
         name = __name__
     if name in logging.Logger.manager.loggerDict:
         return logging.getLogger(name)
-    if setup_distributed:
-        assert dist.is_initialized() and mpu.is_initialized()
-        fmt = '[%(asctime)s] [%(process)d] [TP%(tp)d CP%(cp)d PP%(pp)d DP%(dp)d] [%(levelname)s] %(message)s'
-        formatter = DistributedFormatter(
-            fmt,
-            datefmt='%Y/%m/%d %H:%M:%S',
-            tp_rank=mpu.get_tensor_model_parallel_rank(),
-            pp_rank=mpu.get_pipeline_model_parallel_rank(),
-            cp_rank=mpu.get_context_parallel_rank(),
-            dp_rank=mpu.get_data_parallel_rank()
-        )
-    else:
-        fmt = '[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s'
-        formatter = DistributedFormatter(
-            fmt,
-            datefmt='%Y/%m/%d %H:%M:%S'
-        )
+    formatter = _build_formatter(setup_distributed)
     handler = logging.StreamHandler()
     handler.setLevel(level)
     handler.setFormatter(formatter)
@@ -146,7 +160,6 @@ def setup_logger_v2_sub_process(name: str = None, setup_distributed: bool = True
     if log_queue is None:
         raise ValueError("log_queue must be provided for sub processes")
     _LOGGING_QUEUE = log_queue
-    formatter = _build_formatter(setup_distributed)
     fmt = '[%(asctime)s] [%(process)d] [async_rollout] [%(levelname)s] %(message)s'
     fmt = fmt.replace("async_rollout", name)
     formatter = logging.Formatter(

@@ -1,0 +1,55 @@
+main: main_eval
+training:
+  output_dir: null # 输出目录
+  rollout_batch_size: 256 # 每轮评测最多并发处理的 prompt 数
+  n_samples: 8 # 每个 prompt 的采样次数
+  log_level: info
+
+eval:
+  passed_iters: 0 # 仅用于生成一次评测请求 id，可保持默认 0
+  init_timeout_seconds: 300.0
+  sample_poll_timeout_seconds: 0.5
+
+async_rollout:
+  data: '' # 数据集路径，必须包含唯一 sample_id
+  actor_service_names:
+    - actor_model
+  student_service_name: null
+  teacher_models_registry: null
+  services:
+    - type: sglang
+      name: actor_model
+      resource_cfg:
+        type: sglang
+        is_gpu_resource: True
+        base_port: 18580
+        num_instances: 4
+        params:
+          model_path: ''
+          tp: 2
+          enable_ep: False
+          dist_base_port: 23380
+      params:
+        health_timeout: 300
+        health_retries: 3
+        startup_timeout: 300
+        max_concurrent_per_resource: 2
+      resources: []
+  workers:
+    - type: single_turn
+      params:
+        n_samples: 8
+        max_tokens: 2048
+        advantage_estimator: 'grpo'
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+    - type: math
+      handle_data_types: ['math', 'deepscaler']
+      params:
+        n_samples: 8
+        max_tokens: 2048
+        advantage_estimator: 'grpo'
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+        use_cot_reward: true
+        use_ref_answers: false

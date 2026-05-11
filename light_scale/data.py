@@ -34,6 +34,19 @@ class MultiResponseSample:
     group_content_ids: Optional[List[np.ndarray]] = None
     group_loss_mask: Optional[List[np.ndarray]] = None
     group_teacher_log_probs: Optional[List[np.ndarray]] = None
+    message_type: str = "sample"
+
+    @classmethod
+    def build_end_of_rollout(cls) -> "MultiResponseSample":
+        return cls(
+            prompt="",
+            dataset_type="",
+            ground_truth="",
+            message_type="end_of_rollout",
+        )
+
+    def is_end_of_rollout(self) -> bool:
+        return self.message_type == "end_of_rollout"
 
 @dataclass
 class Sample:

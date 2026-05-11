@@ -27,6 +27,8 @@ def rollout_thread_main(
 	start_event,
 	failed_event,
 	log_level: int,
+	rollout_mode: str = "train",
+	completed_ids_path: str = None,
 ):
 	"""rollout 线程主函数，负责初始化上下文并启动 asyncio 主循环。"""
 	logger = setup_logger_v2_sub_process(
@@ -62,6 +64,8 @@ def rollout_thread_main(
 				rollout_batch_size=rollout_batch_size,
 				passed_iters=passed_iters,
 				async_cfg=async_cfg,
+				rollout_mode=rollout_mode,
+				completed_ids_path=completed_ids_path,
 				input_queue=input_queue,
 				output_queue=output_queue,
 				stop_event=stop_event,

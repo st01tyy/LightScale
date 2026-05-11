@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Dict, List, Tuple, Type, Optional
 
 import queue
@@ -42,6 +43,8 @@ async def run_rollout_loop(
 	rollout_batch_size: int,
 	passed_iters: int,
 	async_cfg: Dict[str, Any],
+	rollout_mode: str,
+	completed_ids_path: Optional[str],
 	input_queue,
 	output_queue,
 	stop_event,
@@ -59,6 +62,8 @@ async def run_rollout_loop(
 		)
 		context = await _initialize_rollout_context(
 			async_cfg=async_cfg,
+			rollout_mode=rollout_mode,
+			completed_ids_path=completed_ids_path,
 			logger=logger,
 			name_to_services=name_to_services,
 		)
@@ -93,6 +98,7 @@ async def run_rollout_loop(
 		await _run_rollout_loop(
 			rollout_batch_size=rollout_batch_size,
 			passed_iters=passed_iters,
+			rollout_mode=rollout_mode,
 			context=context,
 			input_queue=input_queue,
 			output_queue=output_queue,
@@ -122,6 +128,8 @@ async def run_rollout_loop(
 
 async def _initialize_rollout_context(
 	async_cfg: Dict[str, Any],
+	rollout_mode: str,
+	completed_ids_path: Optional[str],
 	logger: logging.Logger,
 	name_to_services: Dict[str, AsyncBaseService],
 ) -> RolloutContext:
@@ -140,7 +148,10 @@ async def _initialize_rollout_context(
 	data_type_to_teacher_service_name = _build_teacher_service_registry(async_cfg, name_to_services)
 
 	samples = await _load_dataset(async_cfg.get("data"), logger)
-	samples = samples.shuffle(seed=42)
+	if rollout_mode == "eval":
+		samples = _prepare_eval_samples(samples, completed_ids_path, logger)
+	else:
+		samples = samples.shuffle(seed=42)
 	_ensure_worker_service_dependencies(type_to_worker_params, name_to_services)
 	_ensure_student_service_dependency(student_service_name, name_to_services)
 	_ensure_teacher_registry_dependencies(data_type_to_teacher_service_name, name_to_services)
@@ -158,6 +169,7 @@ async def _initialize_rollout_context(
 async def _run_rollout_loop(
 	rollout_batch_size: int,
 	passed_iters: int,
+	rollout_mode: str,
 	context: RolloutContext,
 	input_queue,
 	output_queue,
@@ -167,11 +179,12 @@ async def _run_rollout_loop(
 ) -> None:
 	thread_pool_size = rollout_batch_size
 	total_samples = len(context.samples)
-	if total_samples == 0:
+	if total_samples == 0 and rollout_mode != "eval":
 		raise RolloutInitializationError("数据集为空，无法执行 rollout")
-	cursor = (rollout_batch_size * passed_iters) % total_samples
+	cursor = 0 if total_samples == 0 else (rollout_batch_size * passed_iters) % total_samples
 	logger.info(
-		"Rollout v2 主循环已就绪: total_samples=%s, batch_size=%s, cursor=%s",
+		"Rollout v2 主循环已就绪: mode=%s, total_samples=%s, batch_size=%s, cursor=%s",
+		rollout_mode,
 		total_samples,
 		rollout_batch_size,
 		cursor,
@@ -181,6 +194,32 @@ async def _run_rollout_loop(
 		passed_iters_value = await _queue_get(input_queue)
 		if passed_iters_value is None:
 			await asyncio.sleep(0.1)
+			continue
+
+		if rollout_mode == "eval":
+			logger.info("Eval rollout started")
+			if total_samples == 0:
+				await _queue_put(output_queue, MultiResponseSample.build_end_of_rollout())
+				logger.info("Eval rollout finished with empty dataset")
+				continue
+
+			while cursor < total_samples and not stop_event.is_set():
+				batch_end = min(cursor + rollout_batch_size, total_samples)
+				batch_ids = list(range(cursor, batch_end))
+				batch_samples = context.samples.select(batch_ids)
+				logger.info("Eval batch started: start=%s, end=%s", cursor, batch_end)
+				await _execute_batch(
+					batch_samples=batch_samples,
+					context=context,
+					stop_event=stop_event,
+					output_queue=output_queue,
+					logger=logger,
+					log_level=log_level,
+				)
+				cursor = batch_end
+
+			await _queue_put(output_queue, MultiResponseSample.build_end_of_rollout())
+			logger.info("Eval rollout finished")
 			continue
 
 		batch_ids: List[int] = []
@@ -518,6 +557,57 @@ def _ensure_data_worker_dependencies(
 			raise RolloutInitializationError(
 				f"样本数据类型 {data_type} 未找到可处理的 worker"
 			)
+
+
+def _prepare_eval_samples(
+	samples: datasets.Dataset,
+	completed_ids_path: Optional[str],
+	logger: logging.Logger,
+) -> datasets.Dataset:
+	if "sample_id" not in samples.column_names:
+		raise RolloutInitializationError("eval 模式要求数据集包含 sample_id 字段")
+
+	raw_sample_ids = samples["sample_id"]
+	normalized_sample_ids = []
+	seen_ids = set()
+	for sample_id in raw_sample_ids:
+		if sample_id is None:
+			raise RolloutInitializationError("eval 模式要求所有样本都提供非空 sample_id")
+		normalized_sample_id = str(sample_id)
+		if normalized_sample_id in seen_ids:
+			raise RolloutInitializationError(f"eval 模式要求 sample_id 全局唯一，重复 id: {normalized_sample_id}")
+		seen_ids.add(normalized_sample_id)
+		normalized_sample_ids.append(normalized_sample_id)
+
+	completed_ids = _load_completed_sample_ids(completed_ids_path)
+	if not completed_ids:
+		logger.info("eval resume disabled or no completed ids found")
+		return samples
+
+	remaining_indices = [
+		index
+		for index, sample_id in enumerate(normalized_sample_ids)
+		if sample_id not in completed_ids
+	]
+	logger.info(
+		"eval resume loaded %s completed sample ids, remaining samples=%s/%s",
+		len(completed_ids),
+		len(remaining_indices),
+		len(normalized_sample_ids),
+	)
+	return samples.select(remaining_indices)
+
+
+def _load_completed_sample_ids(completed_ids_path: Optional[str]) -> set:
+	if not completed_ids_path or not os.path.exists(completed_ids_path):
+		return set()
+	completed_ids = set()
+	with open(completed_ids_path, "r", encoding="utf-8") as file_obj:
+		for line in file_obj:
+			line = line.strip()
+			if line:
+				completed_ids.add(line)
+	return completed_ids
 
 
 async def _load_dataset(data_path_value: Optional[str], logger: logging.Logger) -> datasets.Dataset:

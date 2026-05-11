@@ -12,6 +12,10 @@ import yaml
 GPU_PER_NODE = 8
 
 
+def is_eval_mode(config: Dict[str, Any]) -> bool:
+    return config.get("main") == "main_eval"
+
+
 @dataclass
 class ResourceInstancePlan:
     """描述一个需要在一个或多个节点启动的 resource 实例。"""
@@ -159,6 +163,12 @@ def calculate_role_assignment(
     assignments = HQAssignments()
     if total_nodes == 0:
         raise RuntimeError("node list is empty")
+
+    if is_eval_mode(config):
+        gpu_slots, whole_node_pool = _build_initial_gpu_slots(total_nodes, 0, 0)
+        _allocate_async_services(config, assignments, gpu_slots, whole_node_pool, total_nodes)
+        _log_gpu_usage_summary(gpu_slots)
+        return assignments
 
     assert "actor" in config, "配置中缺少 actor 字段"
     actor_cfg = config["actor"]
@@ -925,6 +935,28 @@ def generate_actor_cmd(
 
     return " ".join(cmd)
 
+
+def generate_eval_cmd(config: dict) -> str:
+    output_dir = config["training"]["output_dir"]
+    assert output_dir, "eval 模式必须指定 output_dir"
+    output_dir = os.path.abspath(output_dir)
+    dump_path = os.path.join(output_dir, "eval_results")
+    os.makedirs(dump_path, exist_ok=True)
+
+    eval_cfg = config.get("eval", {}) or {}
+    cmd = [
+        "python3 main_eval.py",
+        f"--async_rollout_cfg_path {os.path.join(output_dir, 'resolved_async_rollout.yaml')}",
+        f"--rollout_batch_size {config['training']['rollout_batch_size']}",
+        f"--dump_path {dump_path}",
+        f"--n_samples {config['training']['n_samples']}",
+        f"--passed_iters {eval_cfg.get('passed_iters', 0)}",
+        f"--light_scale_log_level {config['training']['log_level']}",
+        f"--init_timeout_seconds {eval_cfg.get('init_timeout_seconds', 300.0)}",
+        f"--sample_poll_timeout_seconds {eval_cfg.get('sample_poll_timeout_seconds', 0.5)}",
+    ]
+    return " ".join(cmd)
+
 def generate_ref_cmd(
     config: dict,
     assignments: HQAssignments,
@@ -1091,6 +1123,9 @@ def main() -> None:
     # 生成并打印本节点需要启动的命令
     cmds = []
 
+
+    if is_eval_mode(config) and node_rank == 0:
+        cmds.append(generate_eval_cmd(config))
 
     if assignments.run_actor:
         cmds.append(
