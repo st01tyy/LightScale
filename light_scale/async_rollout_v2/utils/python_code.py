@@ -29,9 +29,13 @@ class PythonCodeExecutionRequest:
     code: str
     timeout_seconds: int
     max_output_bytes: int
+    do_safety_check: bool = True
+    do_compile: bool = True
     stdin_text: Optional[str] = None
     prelude: str = "import math\nimport numpy as np\n"
     tmp_dir_root: str = "/tmp"
+    work_dir_name: Optional[str] = None
+    clean_work_dir: bool = True
     filename: str = "main.py"
     input_filename: str = "input.txt"
     output_filename: str = "output.txt"
@@ -164,19 +168,24 @@ def validate_generated_code_safety(code: str) -> Tuple[bool, str]:
 
 def execute_python_code(request: PythonCodeExecutionRequest) -> PythonCodeExecutionResult:
     clean_code = _normalize_code(request.code)
-    is_safe, safety_reason = validate_generated_code_safety(clean_code)
-    if not is_safe:
-        return PythonCodeExecutionResult(
-            status=PythonCodeExecutionStatus.SAFETY_VIOLATION,
-            stdout=f"Python Safety Error: {safety_reason}",
-            output_truncated=False,
-            failure_reason=safety_reason,
-        )
+    if request.do_safety_check:
+        is_safe, safety_reason = validate_generated_code_safety(clean_code)
+        if not is_safe:
+            return PythonCodeExecutionResult(
+                status=PythonCodeExecutionStatus.SAFETY_VIOLATION,
+                stdout=f"Python Safety Error: {safety_reason}",
+                output_truncated=False,
+                failure_reason=safety_reason,
+            )
 
-    work_dir = tempfile.mkdtemp(
-        prefix=f"light_scale_python_code_{uuid.uuid4().hex}_",
-        dir=request.tmp_dir_root,
-    )
+    if request.work_dir_name is not None:
+        work_dir = _resolve_named_work_dir(request)
+        os.makedirs(work_dir, exist_ok=True)
+    else:
+        work_dir = tempfile.mkdtemp(
+            prefix=f"light_scale_python_code_{uuid.uuid4().hex}_",
+            dir=request.tmp_dir_root,
+        )
     code_path = os.path.join(work_dir, request.filename)
     input_path = os.path.join(work_dir, request.input_filename)
     output_path = os.path.join(work_dir, request.output_filename)
@@ -184,13 +193,15 @@ def execute_python_code(request: PythonCodeExecutionRequest) -> PythonCodeExecut
 
     try:
         script_text = _build_python_subprocess_script(clean_code, request.prelude)
-        Path(code_path).write_text(script_text, encoding="utf-8")
+        if not os.path.exists(code_path):
+            Path(code_path).write_text(script_text, encoding="utf-8")
         if request.stdin_text is not None:
             Path(input_path).write_text(request.stdin_text, encoding="utf-8")
 
-        syntax_result = _run_python_syntax_check(code_path)
-        if syntax_result is not None:
-            return syntax_result
+        if request.do_compile:
+            syntax_result = _run_python_syntax_check(code_path)
+            if syntax_result is not None:
+                return syntax_result
 
         with open(output_path, "wb") as output_file:
             if request.stdin_text is None:
@@ -274,11 +285,25 @@ def execute_python_code(request: PythonCodeExecutionRequest) -> PythonCodeExecut
             failure_reason=f"Python runner error: {err}",
         )
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if request.clean_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def clean_work_dir(request: PythonCodeExecutionRequest) -> None:
+    if request.work_dir_name is None:
+        raise ValueError("work_dir_name must be provided when cleaning a work directory")
+    work_dir = _resolve_named_work_dir(request)
+    if not os.path.exists(work_dir):
+        return
+    shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _normalize_code(code: str) -> str:
     return code.replace("```python", "").replace("```", "").strip()
+
+
+def _resolve_named_work_dir(request: PythonCodeExecutionRequest) -> str:
+    return os.path.join(request.tmp_dir_root, request.work_dir_name)
 
 
 def _build_python_subprocess_script(code: str, prelude: str) -> str:
