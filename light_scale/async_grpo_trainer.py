@@ -820,7 +820,10 @@ class GRPOTrainer:
         input_ids = dist_utils._sync_2D_input_data(input_ids, torch.int64, shape_tensor)
         labels = dist_utils._sync_2D_input_data(labels, torch.int64, shape_tensor)
         loss_mask = dist_utils._sync_2D_input_data(loss_mask, torch.float32, shape_tensor)
-        teacher_logps = dist_utils._sync_2D_input_data(teacher_logps, torch.float32, shape_tensor)
+        if need_teacher_logps:
+            teacher_logps = dist_utils._sync_2D_input_data(teacher_logps, torch.float32, shape_tensor)
+        else:
+            teacher_logps = None
         outcome_rewards = dist_utils._sync_2D_input_data(
             outcome_rewards.unsqueeze(dim=0) if outcome_rewards is not None else None, 
             torch.float32, torch.LongTensor([1, shape_tensor[0]])

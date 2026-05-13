@@ -151,7 +151,7 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 		)
 		if self.stop_event.is_set():
 			self._clear_sample(sample)
-			logger.debug("stop_event 已置位，直接清空样本输出")
+			logger.warning("stop_event 已置位，直接清空样本输出")
 			return sample
 		self._maybe_apply_force_thinking_prompt(sample)
 		task = self._build_task_from_sample(sample, raw_sample)
@@ -200,9 +200,9 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 		sample.normed_rewards = []
 		sample.completion_tokens = 0
 		sample.total_tokens = 0
-		sample.group_content_ids = []
-		sample.group_loss_mask = []
-		sample.group_teacher_log_probs = []
+		sample.group_content_ids = None
+		sample.group_loss_mask = None
+		sample.group_teacher_log_probs = None
 
 	def _maybe_apply_force_thinking_prompt(self, sample: MultiResponseSample) -> None:
 		if not self._config.force_thinking:
@@ -302,9 +302,9 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 			sample.group_messages = []
 			sample.completion_tokens = 0
 			sample.total_tokens = 0
-			sample.group_content_ids = []
-			sample.group_loss_mask = []
-			sample.group_teacher_log_probs = []
+			sample.group_content_ids = None
+			sample.group_loss_mask = None
+			sample.group_teacher_log_probs = None
 			return
 		responses = [text for text, _ in result.responses]
 		expected = self._config.n_samples
@@ -317,9 +317,9 @@ class AsyncSingleTurnWorker(AsyncBaseWorker, ABC):
 		self._sync_group_messages_from_responses(sample)
 		sample.completion_tokens = result.completion_tokens
 		sample.total_tokens = result.total_tokens
-		sample.group_content_ids = []
-		sample.group_loss_mask = []
-		sample.group_teacher_log_probs = []
+		sample.group_content_ids = None
+		sample.group_loss_mask = None
+		sample.group_teacher_log_probs = None
 
 	async def _prepare_teacher_distillation_targets(self, sample: MultiResponseSample) -> Optional[List[Dict[str, float]]]:
 		message_groups = sample.group_messages or []
