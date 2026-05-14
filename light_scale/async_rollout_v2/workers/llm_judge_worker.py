@@ -26,6 +26,7 @@ class AsyncLLMJudgeWorkerConfig(AsyncSingleTurnWorkerConfig):
     """LLM Judge worker 配置。"""
 
     # Judge specific fields
+    judge_mode: str = "ground_truth"
     judge_timeout: float = 600.0
     judge_retry: int = 2
     judge_json_retries: int = 2
@@ -130,7 +131,7 @@ class AsyncLLMJudgeWorker(AsyncSingleTurnWorker):
         )
 
     def _build_judge_messages(self, sample: MultiResponseSample, response: str) -> List[Dict[str, str]]:
-        return build_judge_messages(sample, response)
+        return build_judge_messages(sample, response, self._config.judge_mode)
 
     def _parse_judge_json(self, raw_text: str) -> dict:
         return parse_judge_json(raw_text)

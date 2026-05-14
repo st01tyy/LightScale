@@ -16,6 +16,7 @@ from light_scale.data import MultiResponseSample
 
 @dataclass
 class LLMJudgeConfig:
+    judge_mode: str = "ground_truth"
     judge_timeout: float = 600.0
     judge_retry: int = 2
     judge_json_retries: int = 2
@@ -30,6 +31,7 @@ class LLMJudgeConfig:
         if judge_max_tokens is None:
             judge_max_tokens = fallback_max_tokens if fallback_max_tokens is not None else default.judge_max_tokens
         return cls(
+            judge_mode=str(getattr(source, "judge_mode", default.judge_mode)),
             judge_timeout=float(getattr(source, "judge_timeout", default.judge_timeout)),
             judge_retry=int(getattr(source, "judge_retry", default.judge_retry)),
             judge_json_retries=int(getattr(source, "judge_json_retries", default.judge_json_retries)),
@@ -63,7 +65,7 @@ def maybe_extract_cot_response(
     return "no response"
 
 
-def build_judge_messages(sample: MultiResponseSample, response: str) -> List[Dict[str, str]]:
+def build_ground_truth_judge_messages(sample: MultiResponseSample, response: str) -> List[Dict[str, str]]:
     question = sample.problem if sample.problem is not None else sample.prompt
     system_prompt = """
 You are a rigorous and objective Evaluation Agent. Your sole task is to determine if a Candidate Answer matches the Ground Truth for a given Question.
@@ -96,6 +98,53 @@ Candidate Answer:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def build_direct_judge_messages(sample: MultiResponseSample, response: str) -> List[Dict[str, str]]:
+    question = sample.problem if sample.problem is not None else sample.prompt
+    system_prompt = """
+You are a rigorous and objective Evaluation Agent. Your task is to judge whether a Candidate Answer correctly answers a given Question, using the Question itself as the basis for evaluation.
+
+# Task Requirements
+1. Solve-as-needed: You may reason about the Question to determine whether the Candidate Answer is correct.
+2. Correctness First: Focus on factual, mathematical, and logical correctness. Ignore stylistic issues unless they make the answer incorrect or non-responsive.
+3. Instruction Following Matters: Treat explicit requirements in the Question as part of correctness. This includes requested answer format, output schema, units, rounding rules, response length limits, whether explanation is allowed or forbidden, whether only a final answer should be returned, and any other response constraints.
+4. Format Violations Count as Incorrect: If the Candidate Answer is factually right but violates a required output format or instruction-following constraint in the Question, mark it as false.
+5. Conservative Judgement: If the Candidate Answer is ambiguous, incomplete, self-contradictory, or you cannot reliably verify it from the Question, mark it as false.
+6. Constraint on Hint: If the answer is incorrect, provide a hint in the second person (You). Point out the nature of the error but NEVER reveal the final correct answer directly.
+
+# Output Format
+You must output a valid JSON object with the following keys:
+- reasoning: A brief internal explanation of why the answer is correct or incorrect.
+- verdict: boolean (true/false).
+- hint: A concise, second-person message to the candidate explaining their mistake without directly giving away the final answer.
+"""
+    user_prompt = f"""
+Please evaluate the following:
+
+Question:
+{question}
+
+Candidate Answer:
+{response}
+"""
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_judge_messages(
+    sample: MultiResponseSample,
+    response: str,
+    judge_mode: str = "ground_truth",
+) -> List[Dict[str, str]]:
+    mode = (judge_mode or "ground_truth").strip().lower()
+    if mode == "ground_truth":
+        return build_ground_truth_judge_messages(sample, response)
+    if mode == "direct":
+        return build_direct_judge_messages(sample, response)
+    raise ValueError(f"unknown judge_mode: {judge_mode}")
 
 
 def parse_judge_json(raw_text: str) -> Dict[str, Any]:
@@ -151,7 +200,7 @@ async def judge_single_response(
     if not text or text == "no response":
         return 0.0, {"verdict": 0, "judge_ok": 1, "format": 0}
 
-    messages = build_judge_messages(sample, response)
+    messages = build_judge_messages(sample, response, judge_config.judge_mode)
     retry_count = 0
     max_json_retries = max(0, judge_config.judge_json_retries)
 
