@@ -166,7 +166,6 @@ To study or extend the core trainers, inspect:
 ## Project Notice
 
 - This project is intended for learning and technical exchange around large language model post-training. Please evaluate usage risks yourself. The authors disclaim liability for risks or losses arising from use of this project.
-- This project was developed within the China Mobile Jiutian: [https://jiutian.10086.cn/](https://jiutian.10086.cn/)
 - Contact email: tao_tyy@sina.com
 
 ## License and Acknowledgements
