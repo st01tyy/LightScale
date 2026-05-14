@@ -1,18 +1,15 @@
 """Async math worker for async rollout v2."""
 
-import asyncio
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
-from light_scale.async_rollout_v2.executors import get_process_pool
 from light_scale.async_rollout_v2.workers.base_worker import (
 	AsyncSingleTurnWorker,
 	AsyncSingleTurnWorkerConfig,
 )
+from light_scale.async_rollout_v2.workers.rule_based_reward_helper import compute_rule_based_reward
 from light_scale.data import MultiResponseSample
-from verifier.rule_based_rm import compute_score as rule_based_score
-from verifier.rule_based_rm_cot import compute_score as rule_based_score_cot
 from copy import deepcopy
 import re
 
@@ -154,14 +151,12 @@ class AsyncMathWorker(AsyncSingleTurnWorker):
 		prompt: str,
 	) -> Tuple[float, dict]:
 		"""根据是否跳过思考内容选择不同的 rule-based RM。"""
-		pool = get_process_pool()
-		loop = asyncio.get_running_loop()
-		if self._config.force_thinking:
-			response = self._config.begin_of_thinking + response
-		if not self._config.use_cot_reward:
-			return await loop.run_in_executor(
-				pool, rule_based_score, dataset_type, response, ground_truth, prompt
-			)
-		return await loop.run_in_executor(
-			pool, rule_based_score_cot, dataset_type, response, ground_truth, prompt
+		return await compute_rule_based_reward(
+			dataset_type=dataset_type,
+			response=response,
+			ground_truth=ground_truth,
+			prompt=prompt,
+			force_thinking=self._config.force_thinking,
+			begin_of_thinking=self._config.begin_of_thinking,
+			use_cot_reward=self._config.use_cot_reward,
 		)

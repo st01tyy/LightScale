@@ -12,6 +12,7 @@ from light_scale.async_rollout_v2.workers.if_rubric_worker import AsyncIFRubricW
 from light_scale.async_rollout_v2.workers.math_worker import AsyncMathWorker
 from light_scale.async_rollout_v2.workers.math_tool_worker import AsyncMathToolWorker
 from light_scale.async_rollout_v2.workers.llm_judge_worker import AsyncLLMJudgeWorker
+from light_scale.async_rollout_v2.workers.rule_llm_mixed_worker import AsyncRuleLLMMixedWorker
 from light_scale.async_rollout_v2.workers.rock_worker import RockWorker
 
 
@@ -29,5 +30,6 @@ WORKER_CLASS_REGISTRY: Dict[str, Type[AsyncBaseWorker]] = {
 	"math": AsyncMathWorker,
 	"math_tool": AsyncMathToolWorker,
 	"llm_judge": AsyncLLMJudgeWorker,
+	"rule_llm_mixed": AsyncRuleLLMMixedWorker,
 	"rock": RockWorker,
 }
