@@ -532,7 +532,18 @@ class GRPOTrainer:
                 # TODO: should exit the while loop
                 # assert len(batch_samples) > 0, f"current_samples: {len(current_samples)}, current_invalid_samples: {len(current_invalid_samples)}"
                 if len(batch_samples) > 0:
-                    self.logger.info(f"iter {rollout_step} batch {batch_num} created, samples: {len(batch_samples)}, {num_received_batch_samples} / {self.args.rollout_batch_size} samples received from rollout")
+                    if all(sample.teacher_log_probs is None for sample in batch_samples):
+                        avg_normed_reward = sum(sample.normed_reward for sample in batch_samples) / len(batch_samples)
+                        self.logger.info(
+                            f"iter {rollout_step} batch {batch_num} created, samples: {len(batch_samples)}, "
+                            f"{num_received_batch_samples} / {self.args.rollout_batch_size} samples received from rollout, "
+                            f"avg_normed_reward: {avg_normed_reward:.6f}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"iter {rollout_step} batch {batch_num} created, samples: {len(batch_samples)}, "
+                            f"{num_received_batch_samples} / {self.args.rollout_batch_size} samples received from rollout"
+                        )
                     batch_experience = self.collate_fn_optimized(batch_samples)
                 else:
                     # self.logger.warning("no valid training samples, skipping this batch")

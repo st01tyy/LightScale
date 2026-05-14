@@ -88,11 +88,13 @@ async def run_rollout_loop(
 		failed_event.set()
 		return
 
-	get_process_pool(32)
-	logger.info("进程池已初始化")
+	process_pool_size = int(async_cfg.get("process_pool_size", 32))
+	get_process_pool(process_pool_size)
+	logger.info("进程池已初始化，大小=%s", process_pool_size)
 
-	get_thread_pool(32)
-	logger.info("线程池已初始化")
+	thread_pool_size = int(async_cfg.get("thread_pool_size", 32))
+	get_thread_pool(thread_pool_size)
+	logger.info("线程池已初始化，大小=%s", thread_pool_size)
 
 	try:
 		await _run_rollout_loop(

@@ -94,6 +94,8 @@ distillation:
     seq_kd: False # whether to use sequence-level kd
 async_rollout:
   data: '' # 数据集路径
+  process_pool_size: 32 # 本地进程池大小
+  thread_pool_size: 32 # 本地线程池大小
   actor_service_names: # actor模型服务名称列表
     - actor_model
   student_service_name: null # 可选；student native service 名称，需指向 sglang_native 服务
