@@ -12,6 +12,7 @@ from light_scale.async_rollout_v2.workers.rule_based_reward_helper import comput
 from light_scale.data import MultiResponseSample
 from copy import deepcopy
 import re
+import asyncio
 
 async def reward_fn(completion, ground_truth):
     """
