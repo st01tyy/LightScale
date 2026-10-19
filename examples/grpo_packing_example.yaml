@@ -1,0 +1,151 @@
+# 最简普通 GRPO 的 async THD packing 样例。
+# 适用范围：没有 teacher logps、没有 reference model，直接将 outcome reward 用作 advantage。
+# 当前 THD GRPO packing 不支持 distillation、reference KL 或 old actor logps。
+main: main_async_actor
+
+training:
+  output_dir: null # 输出目录
+  from_pretrained: null # actor 模型加载路径，Megatron Core 格式
+  rollout_model_name: null # rollout 推理服务加载路径，Hugging Face 格式
+  resume_checkpoint: null # 断点续训 actor 模型目录
+  max_steps: 315
+  save_steps: 5
+  early_stop_steps: 400
+  non_persistent_save_steps: 0
+  save_test_step: 5
+  optim:
+    lr: 5e-7
+    min_lr: 5e-8
+    warmup_ratio: 0.03
+    scheduler_type: cosine
+    weight_decay: 0.1
+    adam_beta1: 0.9
+    adam_beta2: 0.98
+    adam_eps: 1e-8
+  seed: 42
+  rollout_batch_size: 256 # 每个 rollout step 的 prompt 数
+  global_batch_size: 2048 # rollout_batch_size * n_samples
+  n_samples: 8 # 每个 prompt 采样的 response 数
+  micro_batch_size: 1 # THD packing 的硬性要求
+  micro_forward_batch_size: 4
+  max_length: 4096
+  sequence_packing: True # 启用普通 GRPO 的 THD packing
+  packing_mode: flash # flash: FA2 物理 CU；fused 需要后端支持
+  max_response_length: null # 可选：每条 response 最大监督 token 数
+  max_pad_token_ratio: null
+  pad_to_max_length: False
+  dump_experience: True
+  dump_tensors: False
+  log_level: info
+  use_outcome_rewards_as_advantages: True # THD GRPO 当前只支持此模式
+  skip_zero_reward_sample: True
+  policy_loss_limit: 3.25
+  kl_loss_limit: 10
+  mlp_weight_merging_batch_size: 24
+  entropy_loss_threshold: 0.3 # 当前 entropy 仅记录，不参与反传
+  moe_weight_merging_layer_batch_size: 10
+  moe_weight_merging_expert_batch_size: 10
+
+algorithm:
+  init_kl_coef: 0.0 # 必须为 0：packing GRPO 当前不支持 reference KL
+  use_kl_loss: False
+  kl_estimator: k3
+  advantage_estimator: grpo
+  reward_clip_range: null
+  num_repeat_times: 1
+  entropy_loss_coef: -1.0 # 禁用 entropy 指标；当前它不会加入训练 loss
+  policy_loss_coef: 1.0
+  opd_clip_coef: null # 普通 GRPO 不使用 OPD 裁剪
+  negate_kl_loss: False
+
+actor:
+  tp: 4
+  pp: 2
+  cp: 1 # 建议先用 CP=1 验证；THD 路径也支持 CP>1
+  dp: 8
+  moe:
+    ep: 1
+    etp: null
+  weight_update_group_port: 65500
+  pack_n_samples: False
+  extra_args:
+    - key: recompute-granularity
+      value: selective
+
+# 本样例禁用 reference，但保留完整 schema 以兼容配置加载器。
+reference:
+  micro_batch_size: 2
+  tp: 2
+  pp: 1
+  cp: 1
+  dp: 4
+  moe:
+    ep: 1
+    etp: null
+  load_path: null
+
+distributed_lock_server:
+  port: 13266
+
+weight_updater_test:
+  online_test: False
+
+distillation:
+  enabled: False # 必须为 false：THD GRPO packing 当前不支持蒸馏
+  logits_express:
+    dtype: fp32
+    batch_size: 4
+    base_port: 45000
+  gkd:
+    student_temperature: 1.0
+    teacher_temperature: 1.0
+    beta: 0.0
+    seq_kd: False
+
+async_rollout:
+  max_train_batch_size: -1 # -1 表示不限制，实际值会按最小可训练 batch 对齐
+  data: '' # 训练/rollout 数据集路径
+  validation_data_paths: null
+  process_pool_size: 32
+  thread_pool_size: 32
+  actor_service_names:
+    - actor_model
+  student_service_name: null
+  teacher_models_registry: null # 普通 GRPO 不配置 teacher
+  services:
+    - type: sglang
+      name: actor_model
+      resource_cfg:
+        type: sglang
+        is_gpu_resource: True
+        base_port: 18580
+        num_instances: 4
+        params:
+          model_path: ''
+          tp: 2
+          enable_ep: False
+          dist_base_port: 23380
+      params:
+        health_timeout: 300
+        health_retries: 3
+        startup_timeout: 300
+        max_concurrent_per_resource: 2
+      resources: [] # 由 headquarters 填充
+  workers:
+    - type: single_turn
+      params:
+        n_samples: 8 # 必须与 training.n_samples 一致
+        max_tokens: 2048
+        advantage_estimator: grpo
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+    - type: math
+      handle_data_types: ['math', 'deepscaler']
+      params:
+        n_samples: 8
+        max_tokens: 2048
+        advantage_estimator: grpo
+        stop_token: '<|endoftext|>'
+        add_stop_token: true
+        use_cot_reward: true
+        use_ref_answers: false

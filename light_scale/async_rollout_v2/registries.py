@@ -1,0 +1,35 @@
+"""Service/worker registries for async rollout v2."""
+
+from typing import Dict, Type
+
+from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
+from light_scale.async_rollout_v2.services.rock_service import AsyncRockService
+from light_scale.async_rollout_v2.services.sglang_native_service import AsyncSGLangNativeService
+from light_scale.async_rollout_v2.services.sglang_service import AsyncSGLangService
+from light_scale.async_rollout_v2.workers.base_worker import AsyncBaseWorker, AsyncSingleTurnWorker
+from light_scale.async_rollout_v2.workers.code_worker import AsyncCodeWorker
+from light_scale.async_rollout_v2.workers.if_rubric_worker import AsyncIFRubricWorker
+from light_scale.async_rollout_v2.workers.math_worker import AsyncMathWorker
+from light_scale.async_rollout_v2.workers.math_tool_worker import AsyncMathToolWorker
+from light_scale.async_rollout_v2.workers.llm_judge_worker import AsyncLLMJudgeWorker
+from light_scale.async_rollout_v2.workers.rule_llm_mixed_worker import AsyncRuleLLMMixedWorker
+from light_scale.async_rollout_v2.workers.rock_worker import RockWorker
+
+
+SERVICE_CLASS_REGISTRY: Dict[str, Type[AsyncBaseService]] = {
+	"rock": AsyncRockService,
+	"sglang_native": AsyncSGLangNativeService,
+	"sglang": AsyncSGLangService,
+}
+
+
+WORKER_CLASS_REGISTRY: Dict[str, Type[AsyncBaseWorker]] = {
+	"single_turn": AsyncSingleTurnWorker,
+	"code": AsyncCodeWorker,
+	"if_rubric": AsyncIFRubricWorker,
+	"math": AsyncMathWorker,
+	"math_tool": AsyncMathToolWorker,
+	"llm_judge": AsyncLLMJudgeWorker,
+	"rule_llm_mixed": AsyncRuleLLMMixedWorker,
+	"rock": RockWorker,
+}

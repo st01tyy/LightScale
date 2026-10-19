@@ -1,0 +1,18 @@
+main: weight_updater_test
+
+training:
+  output_dir: /path/to/output
+  from_pretrained: /path/to/megatron_checkpoint
+
+actor:
+  tp: 4
+  pp: 2
+  cp: 1
+  dp: 8
+  weight_update_group_port: 65500
+
+distributed_lock_server:
+  port: 13266
+
+weight_updater_test:
+  online_test: false

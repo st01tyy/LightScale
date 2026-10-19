@@ -1,0 +1,797 @@
+"""Asyncio main loop for rollout v2."""
+
+import asyncio
+from dataclasses import dataclass
+import logging
+import os
+import random
+from typing import Any, Dict, List, Tuple, Type, Optional, Set
+
+import queue
+import datasets
+from datasets import load_from_disk
+
+from light_scale.data import MultiResponseSample, Resource
+from light_scale.async_rollout_v2.executors import get_process_pool, close_all, get_thread_pool
+from light_scale.async_rollout_v2.registries import SERVICE_CLASS_REGISTRY, WORKER_CLASS_REGISTRY
+from light_scale.async_rollout_v2.services.base_service import AsyncBaseService
+from light_scale.async_rollout_v2.services.sglang_native_service import AsyncSGLangNativeService
+from light_scale.async_rollout_v2.workers.base_worker import AsyncBaseWorker
+
+
+class RolloutInitializationError(Exception):
+	"""Raised when rollout initialization fails."""
+
+	pass
+
+
+@dataclass
+class DatasetSource:
+	"""One logical data source participating in rollout batching."""
+
+	data_path: str
+	take_per_batch: int
+	samples: datasets.Dataset
+	cursor: int
+
+
+@dataclass
+class RolloutContext:
+	"""Runtime context built during rollout initialization."""
+
+	name_to_services: Dict[str, AsyncBaseService]
+	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]]
+	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]]
+	student_service_name: Optional[str]
+	data_type_to_teacher_service_name: Dict[str, str]
+	dataset_sources: List[DatasetSource]
+
+	def get_services_to_stop(self) -> List[AsyncBaseService]:
+		return list(self.name_to_services.values())
+
+
+async def run_rollout_loop(
+	rollout_batch_size: int,
+	passed_iters: int,
+	async_cfg: Dict[str, Any],
+	rollout_mode: str,
+	completed_ids_path: Optional[str],
+	input_queue,
+	output_queue,
+	stop_event,
+	start_event,
+	failed_event,
+	logger: logging.Logger,
+	log_level: int,
+) -> None:
+	"""asyncio 主循环：按批次并发执行 worker，结果写回输出队列。"""
+	context: Optional[RolloutContext] = None
+	name_to_services: Dict[str, AsyncBaseService] = {}
+	try:
+		name_to_services = await _initialize_services(
+			async_cfg.get("services") or [], stop_event, logger, log_level
+		)
+		context = await _initialize_rollout_context(
+			async_cfg=async_cfg,
+			rollout_batch_size=rollout_batch_size,
+			passed_iters=passed_iters,
+			rollout_mode=rollout_mode,
+			completed_ids_path=completed_ids_path,
+			logger=logger,
+			name_to_services=name_to_services,
+		)
+		start_event.set()
+		logger.info("Rollout v2 初始化完成，启动主循环。")
+	except RolloutInitializationError as err:
+		logger.error("Rollout 初始化失败: %s", err)
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
+		elif name_to_services:
+			await _stop_services(list(name_to_services.values()), logger)
+		stop_event.set()
+		failed_event.set()
+		return
+	except Exception as err:
+		logger.exception("Rollout 初始化出现未预期异常: %s", err)
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
+		elif name_to_services:
+			await _stop_services(list(name_to_services.values()), logger)
+		stop_event.set()
+		failed_event.set()
+		return
+
+	process_pool_size = int(async_cfg.get("process_pool_size", 32))
+	get_process_pool(process_pool_size)
+	logger.info("进程池已初始化，大小=%s", process_pool_size)
+
+	thread_pool_size = int(async_cfg.get("thread_pool_size", 32))
+	get_thread_pool(thread_pool_size)
+	logger.info("线程池已初始化，大小=%s", thread_pool_size)
+
+	try:
+		await _run_rollout_loop(
+			rollout_batch_size=rollout_batch_size,
+			passed_iters=passed_iters,
+			rollout_mode=rollout_mode,
+			context=context,
+			input_queue=input_queue,
+			output_queue=output_queue,
+			stop_event=stop_event,
+			logger=logger,
+			log_level=log_level,
+		)
+	except asyncio.CancelledError:
+		logger.warning(
+			"Rollout v2 asyncio loop received cancellation",
+		)
+		raise
+	except Exception as err:
+		logger.exception("Rollout v2 asyncio loop crashed unexpectedly")
+		raise
+	finally:
+		if context is not None:
+			await _stop_services(context.get_services_to_stop(), logger)
+		close_all()
+		if stop_event.is_set():
+			logger.warning("Rollout v2 asyncio loop stopping")
+		else:
+			logger.warning(
+				"Rollout v2 asyncio loop exited without stop signal, likely via cancellation/exception unwind"
+			)
+
+
+async def _initialize_rollout_context(
+	async_cfg: Dict[str, Any],
+	rollout_batch_size: int,
+	passed_iters: int,
+	rollout_mode: str,
+	completed_ids_path: Optional[str],
+	logger: logging.Logger,
+	name_to_services: Dict[str, AsyncBaseService],
+) -> RolloutContext:
+	workers_cfg = async_cfg.get("workers") or []
+	for worker_cfg in workers_cfg:
+		worker_type = worker_cfg.get("type", None)
+		if worker_type is None:
+			raise RolloutInitializationError("每个 worker 必须包含 type 字段")
+		if worker_type not in WORKER_CLASS_REGISTRY:
+			raise RolloutInitializationError(f"未知的 worker 类型: {worker_type}")
+	(
+		type_to_worker_params,
+		data_type_to_worker_type,
+		) = _prepare_worker_params(workers_cfg, logger, async_cfg.get("llm_judge") or {})
+	student_service_name = _resolve_student_service_name(async_cfg, name_to_services)
+	data_type_to_teacher_service_name = _build_teacher_service_registry(async_cfg, name_to_services)
+
+	dataset_sources = await _load_dataset_sources(
+		data_cfg=async_cfg.get("data"),
+		rollout_batch_size=rollout_batch_size,
+		passed_iters=passed_iters,
+		rollout_mode=rollout_mode,
+		completed_ids_path=completed_ids_path,
+		logger=logger,
+	)
+	_ensure_worker_service_dependencies(type_to_worker_params, name_to_services)
+	_ensure_student_service_dependency(student_service_name, name_to_services)
+	_ensure_teacher_registry_dependencies(data_type_to_teacher_service_name, name_to_services)
+	_ensure_data_worker_dependencies(data_type_to_worker_type, dataset_sources)
+	return RolloutContext(
+		name_to_services=name_to_services,
+		type_to_worker_params=type_to_worker_params,
+		data_type_to_worker_type=data_type_to_worker_type,
+		student_service_name=student_service_name,
+		data_type_to_teacher_service_name=data_type_to_teacher_service_name,
+		dataset_sources=dataset_sources,
+	)
+
+
+async def _run_rollout_loop(
+	rollout_batch_size: int,
+	passed_iters: int,
+	rollout_mode: str,
+	context: RolloutContext,
+	input_queue,
+	output_queue,
+	stop_event,
+	logger: logging.Logger,
+	log_level: int,
+) -> None:
+	total_samples = sum(len(source.samples) for source in context.dataset_sources)
+	if total_samples == 0 and rollout_mode != "eval":
+		raise RolloutInitializationError("数据集为空，无法执行 rollout")
+	logger.info(
+		"Rollout v2 主循环已就绪: mode=%s, total_samples=%s, batch_size=%s, sources=%s",
+		rollout_mode,
+		total_samples,
+		rollout_batch_size,
+		[
+			{
+				"path": source.data_path,
+				"take_per_batch": source.take_per_batch,
+				"total_samples": len(source.samples),
+				"cursor": source.cursor,
+			}
+			for source in context.dataset_sources
+		],
+	)
+
+	while not stop_event.is_set():
+		passed_iters_value = await _queue_get(input_queue)
+		if passed_iters_value is None:
+			await asyncio.sleep(0.1)
+			continue
+
+		if rollout_mode == "eval":
+			logger.info("Eval rollout started")
+			if total_samples == 0:
+				await _queue_put(output_queue, MultiResponseSample.build_end_of_rollout())
+				logger.info("Eval rollout finished with empty dataset")
+				continue
+
+			while not stop_event.is_set():
+				batch_samples = _build_eval_batch_samples(context, passed_iters_value)
+				if not batch_samples:
+					break
+				logger.info("Eval batch started: size=%s", len(batch_samples))
+				await _execute_batch(
+					batch_samples=batch_samples,
+					context=context,
+					stop_event=stop_event,
+					output_queue=output_queue,
+					logger=logger,
+					log_level=log_level,
+				)
+
+			await _queue_put(output_queue, MultiResponseSample.build_end_of_rollout())
+			logger.info("Eval rollout finished")
+			continue
+
+		batch_samples = _build_train_batch_samples(context, passed_iters_value)
+
+		logger.info("Rollout step %s started", passed_iters_value)
+		await _execute_batch(
+			batch_samples=batch_samples,
+			context=context,
+			stop_event=stop_event,
+			output_queue=output_queue,
+			logger=logger,
+			log_level=log_level,
+		)
+
+
+async def _execute_batch(
+	batch_samples: List[Dict[str, Any]],
+	context: RolloutContext,
+	stop_event,
+	output_queue,
+	logger: logging.Logger,
+	log_level: int,
+) -> None:
+	if stop_event.is_set():
+		return
+
+	tasks = []
+	for sample in batch_samples:
+		if stop_event.is_set():
+			break
+		dataset_type = sample["dataset_type"]
+		worker_cls = context.data_type_to_worker_type[dataset_type]
+		worker_params = context.type_to_worker_params.get(worker_cls, dict())
+		student_service_name = context.student_service_name
+		teacher_service_name = context.data_type_to_teacher_service_name.get(dataset_type)
+		try:
+			worker = worker_cls(
+				input_data=sample,
+				service_dict=context.name_to_services,
+				stop_event=stop_event,
+				log_level=log_level,
+				student_service_name=student_service_name,
+				teacher_service_name=teacher_service_name,
+				**worker_params,
+			)
+			logger.debug(
+				"样本(dataset_type=%s) 分配 worker=%s",
+				sample["dataset_type"],
+				worker_cls,
+			)
+		except Exception as e:
+			logger.error(
+				"worker %s 初始化失败 (dataset_type=%s): %s",
+				worker_cls,
+				sample["dataset_type"],
+				str(e)
+			)
+			stop_event.set()
+			break
+		try:
+			tasks.append(asyncio.create_task(worker.run()))
+		except Exception:
+			logger.error(
+				"worker %s 提交执行失败 (dataset_type=%s)",
+				worker_cls,
+				sample["dataset_type"],
+			)
+			stop_event.set()
+			break
+
+	if not tasks:
+		return
+	completed_tasks = 0
+	total_tasks = len(tasks)
+
+	for task in asyncio.as_completed(tasks):
+		if stop_event.is_set():
+			logger.warning("检测到 stop_event 已设置，停止等待剩余任务完成")
+			break
+		try:
+			result_sample: MultiResponseSample = await task
+			logger.debug("样本完成，写入输出队列")
+			await _queue_put(output_queue, result_sample)
+			completed_tasks += 1
+			logger.info("样本已入队: %d/%d", completed_tasks, total_tasks)
+		except Exception as e:
+			logger.error(f"worker 处理样本失败: {str(e)}")
+			stop_event.set()
+			break
+
+	if stop_event.is_set():
+		logger.warning("检测到 stop_event 已设置，取消所有任务")
+		for task in tasks:
+			task.cancel()
+
+
+async def _initialize_services(
+	service_cfgs: List[Dict[str, Any]],
+	stop_event,
+	logger: logging.Logger,
+	log_level: int,
+) -> Dict[str, AsyncBaseService]:
+	name_to_services: Dict[str, AsyncBaseService] = {}
+	for service_cfg in service_cfgs:
+		service_name = service_cfg.get("name", None)
+		service_type = service_cfg.get("type", None)
+		if not service_name or not service_type:
+			raise RolloutInitializationError("每个 service 必须包含 type 与 name")
+		if service_name in name_to_services:
+			raise RolloutInitializationError(f"检测到重复的 service name: {service_name}")
+
+		resources_cfg = service_cfg.get("resources", None)
+		if not isinstance(resources_cfg, list) or not resources_cfg:
+			raise RolloutInitializationError(
+				f"service {service_name} 未提供 resources 或格式不正确"
+			)
+		resources = _build_resources(resources_cfg)
+		params = service_cfg.get("params") or {}
+		service_cls = SERVICE_CLASS_REGISTRY.get(service_type, None)
+		if service_cls is None:
+			raise RolloutInitializationError(
+				f"service {service_name} 指定了未知类型 {service_type}"
+			)
+		service = service_cls(
+			name=service_name,
+			resources=resources,
+			log_level=log_level,
+			**params,
+		)
+		name_to_services[service_name] = service
+
+	try:
+		for service in name_to_services.values():
+			await service.start()
+			logger.info("service %s 启动成功", service.name)
+		return name_to_services
+	except Exception:
+		if stop_event is not None:
+			stop_event.set()
+		await _stop_services(list(name_to_services.values()), logger)
+		raise
+
+
+def _build_resources(resources_cfg: List[Dict[str, Any]]) -> List[Resource]:
+	resources: List[Resource] = []
+	for resource_params in resources_cfg:
+		resource = Resource(**resource_params)
+		resources.append(resource)
+	if len(resources) == 0:
+		raise RolloutInitializationError("service 的资源列表为空")
+	return resources
+
+
+def _build_teacher_service_registry(
+	async_cfg: Dict[str, Any],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> Dict[str, str]:
+	teacher_models_registry = async_cfg.get("teacher_models_registry")
+	if teacher_models_registry is None:
+		return {}
+	if not isinstance(teacher_models_registry, list):
+		raise RolloutInitializationError("teacher_models_registry 必须是列表或 null")
+
+	data_type_to_teacher_service_name: Dict[str, str] = {}
+	for registry_entry in teacher_models_registry:
+		if not isinstance(registry_entry, dict):
+			raise RolloutInitializationError("teacher_models_registry 的每个条目必须是字典")
+		service_name = registry_entry.get("service_name")
+		data_types = registry_entry.get("data_type")
+		if not isinstance(service_name, str) or not service_name:
+			raise RolloutInitializationError("teacher_models_registry.service_name 必须是非空字符串")
+		if not isinstance(data_types, list) or not data_types:
+			raise RolloutInitializationError("teacher_models_registry.data_type 必须是非空列表")
+		service_instance = name_to_services.get(service_name)
+		if service_instance is None:
+			raise RolloutInitializationError(
+				f"teacher_models_registry 引用的 service {service_name} 未成功启动"
+			)
+		if not isinstance(service_instance, AsyncSGLangNativeService):
+			raise RolloutInitializationError(
+				f"teacher_models_registry 引用的 service {service_name} 必须是 AsyncSGLangNativeService"
+			)
+		for data_type in data_types:
+			if not isinstance(data_type, str) or not data_type:
+				raise RolloutInitializationError("teacher_models_registry.data_type 中的元素必须是非空字符串")
+			if data_type in data_type_to_teacher_service_name:
+				raise RolloutInitializationError(
+					f"dataset_type {data_type} 在 teacher_models_registry 中重复声明"
+				)
+			data_type_to_teacher_service_name[data_type] = service_name
+	return data_type_to_teacher_service_name
+
+
+def _resolve_student_service_name(
+	async_cfg: Dict[str, Any],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> Optional[str]:
+	student_service_name = async_cfg.get("student_service_name")
+	if student_service_name is None:
+		return None
+	if not isinstance(student_service_name, str) or not student_service_name:
+		raise RolloutInitializationError("student_service_name 必须是非空字符串或 null")
+	service_instance = name_to_services.get(student_service_name)
+	if service_instance is None:
+		raise RolloutInitializationError(
+			f"student_service_name 引用的 service {student_service_name} 未成功启动"
+		)
+	if not isinstance(service_instance, AsyncSGLangNativeService):
+		raise RolloutInitializationError(
+			f"student_service_name 引用的 service {student_service_name} 必须是 AsyncSGLangNativeService"
+		)
+	return student_service_name
+
+
+def _prepare_worker_params(
+	worker_cfgs: List[Dict[str, Any]],
+	logger: logging.Logger,
+	shared_llm_judge_cfg: Dict[str, Any],
+) -> Tuple[Dict[type, Dict[str, Any]], Dict[str, type]]:
+	type_to_worker_params: Dict[type, Dict[str, Any]] = dict()
+	standalone_params_dict: Dict[type, Dict[str, Any]] = dict()
+	data_type_to_worker_type: Dict[str, type] = dict()
+	parent_worker_cfgs = [worker_cfg for worker_cfg in worker_cfgs if worker_cfg.get("handle_data_types", None) is None]
+	actual_worker_cfgs = [worker_cfg for worker_cfg in worker_cfgs if worker_cfg.get("handle_data_types", None) is not None]
+	for worker_cfg in parent_worker_cfgs:
+		worker_type = worker_cfg["type"]
+		cfg_params = worker_cfg.get("params", None)
+		if cfg_params is None:
+			raise RolloutInitializationError(f"parent worker {worker_type} 未提供 params")
+		standalone_params_dict[WORKER_CLASS_REGISTRY[worker_type]] = cfg_params
+
+	for worker_cfg in actual_worker_cfgs:
+		worker_type = worker_cfg["type"]
+		if not worker_type:
+			raise RolloutInitializationError("worker 配置缺少 type")
+		cfg_params = worker_cfg.get("params", dict())
+		cfg_params = dict() if cfg_params is None else cfg_params
+		data_types = worker_cfg.get("handle_data_types", None)
+		if data_types is None:
+			logger.warning("worker %s 未指定 handle_data_types", worker_type)
+			continue
+		if not isinstance(data_types, list):
+			raise RolloutInitializationError(
+				f"worker {worker_type} 的 handle_data_types 应为列表"
+			)
+		# assert cfg_params is not None, f"{worker_type} worker params is None"
+		standalone_params_dict[WORKER_CLASS_REGISTRY[worker_type]] = cfg_params
+		for data_type in data_types:
+			if data_type in data_type_to_worker_type:
+				existing_worker = data_type_to_worker_type[data_type]
+				raise RolloutInitializationError(
+					f"数据类型 {data_type} 同时被 worker {existing_worker} 和 {worker_type} 处理"
+				)
+			data_type_to_worker_type[data_type] = WORKER_CLASS_REGISTRY[worker_type]
+
+	def _collect_ancestor_parent_params_and_merge(worker_cls: type) -> Dict[str, Any]:
+		merged_parents_params: Dict[str, Any] = {}
+		ancestors = [c for c in worker_cls.__mro__[1:] if c is not object]
+		ancestors = list(reversed(ancestors))
+		for parent_cls in ancestors:
+			parent_param = standalone_params_dict.get(parent_cls, dict())
+			merged_parents_params.update(parent_param)
+		return merged_parents_params
+
+	for worker_cls, standalone_params in standalone_params_dict.items():
+		merged_parents_params = _collect_ancestor_parent_params_and_merge(worker_cls)
+		worker_params = merged_parents_params
+		if getattr(worker_cls, "USES_LLM_JUDGE", False):
+			worker_params.update(shared_llm_judge_cfg)
+		worker_params.update(standalone_params)
+		type_to_worker_params[worker_cls] = worker_params
+
+	return type_to_worker_params, data_type_to_worker_type
+
+
+def _ensure_worker_service_dependencies(
+	type_to_worker_params: Dict[Type[AsyncBaseWorker], Dict[str, Any]],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> None:
+	for worker_cls in type_to_worker_params.keys():
+		required_service_names = worker_cls.REQUIRED_SERVICE_NAMES
+		for service_name in required_service_names:
+			service_instance = name_to_services.get(service_name, None)
+			if service_instance is None:
+				raise RolloutInitializationError(
+					f"worker {worker_cls.__name__} 依赖的 service {service_name} 未成功启动"
+				)
+
+
+def _ensure_teacher_registry_dependencies(
+	data_type_to_teacher_service_name: Dict[str, str],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> None:
+	for dataset_type, service_name in data_type_to_teacher_service_name.items():
+		service_instance = name_to_services.get(service_name)
+		if service_instance is None:
+			raise RolloutInitializationError(
+				f"dataset_type {dataset_type} 依赖的 teacher service {service_name} 未成功启动"
+			)
+		if not isinstance(service_instance, AsyncSGLangNativeService):
+			raise RolloutInitializationError(
+				f"dataset_type {dataset_type} 依赖的 teacher service {service_name} 不是 AsyncSGLangNativeService"
+			)
+
+
+def _ensure_student_service_dependency(
+	student_service_name: Optional[str],
+	name_to_services: Dict[str, AsyncBaseService],
+) -> None:
+	if student_service_name is None:
+		return
+	service_instance = name_to_services.get(student_service_name)
+	if service_instance is None:
+		raise RolloutInitializationError(
+			f"student_service_name 依赖的 service {student_service_name} 未成功启动"
+		)
+	if not isinstance(service_instance, AsyncSGLangNativeService):
+		raise RolloutInitializationError(
+			f"student_service_name 依赖的 service {student_service_name} 不是 AsyncSGLangNativeService"
+		)
+
+
+def _ensure_data_worker_dependencies(
+	data_type_to_worker_type: Dict[str, Type[AsyncBaseWorker]],
+	dataset_sources: List[DatasetSource],
+):
+	data_types = _collect_dataset_types(dataset_sources)
+	for data_type in data_types:
+		worker_type = data_type_to_worker_type.get(data_type, None)
+		if worker_type is None:
+			raise RolloutInitializationError(
+				f"样本数据类型 {data_type} 未找到可处理的 worker"
+			)
+
+
+def _prepare_eval_samples(
+	samples: datasets.Dataset,
+	completed_ids: Set[str],
+	seen_ids: Set[str],
+	logger: logging.Logger,
+	data_path: str,
+) -> datasets.Dataset:
+	if "sample_id" not in samples.column_names:
+		raise RolloutInitializationError("eval 模式要求数据集包含 sample_id 字段")
+
+	raw_sample_ids = samples["sample_id"]
+	normalized_sample_ids = []
+	for sample_id in raw_sample_ids:
+		if sample_id is None:
+			raise RolloutInitializationError("eval 模式要求所有样本都提供非空 sample_id")
+		normalized_sample_id = str(sample_id)
+		if normalized_sample_id in seen_ids:
+			raise RolloutInitializationError(
+				f"eval 模式要求 sample_id 全局唯一，重复 id: {normalized_sample_id} (data_path={data_path})"
+			)
+		seen_ids.add(normalized_sample_id)
+		normalized_sample_ids.append(normalized_sample_id)
+
+	if not completed_ids:
+		logger.info("eval resume disabled or no completed ids found for dataset=%s", data_path)
+		return samples
+
+	remaining_indices = [
+		index
+		for index, sample_id in enumerate(normalized_sample_ids)
+		if sample_id not in completed_ids
+	]
+	logger.info(
+		"eval resume loaded %s completed sample ids for dataset=%s, remaining samples=%s/%s",
+		len(completed_ids),
+		data_path,
+		len(remaining_indices),
+		len(normalized_sample_ids),
+	)
+	return samples.select(remaining_indices)
+
+
+def _normalize_data_sources(data_cfg: Any, rollout_batch_size: int) -> List[Dict[str, Any]]:
+	if isinstance(data_cfg, str):
+		return [{"n": rollout_batch_size, "data_path": data_cfg}]
+	if not isinstance(data_cfg, list) or not data_cfg:
+		raise RolloutInitializationError("async_rollout.data 必须是非空字符串或非空列表")
+	normalized_sources = []
+	total_take_per_batch = 0
+	seen_paths: Set[str] = set()
+	for index, source_cfg in enumerate(data_cfg):
+		if not isinstance(source_cfg, dict):
+			raise RolloutInitializationError("async_rollout.data 列表中的每个元素都必须是字典")
+		if set(source_cfg.keys()) != {"n", "data_path"}:
+			raise RolloutInitializationError(
+				"async_rollout.data 列表元素只能包含 n 和 data_path 两个字段"
+			)
+		take_per_batch = source_cfg.get("n")
+		data_path = source_cfg.get("data_path")
+		if not isinstance(take_per_batch, int) or take_per_batch <= 0:
+			raise RolloutInitializationError(
+				f"async_rollout.data[{index}].n 必须是正整数"
+			)
+		if not isinstance(data_path, str) or not data_path:
+			raise RolloutInitializationError(
+				f"async_rollout.data[{index}].data_path 必须是非空字符串"
+			)
+		if data_path in seen_paths:
+			raise RolloutInitializationError(
+				f"async_rollout.data 中存在重复 data_path: {data_path}"
+			)
+		seen_paths.add(data_path)
+		total_take_per_batch += take_per_batch
+		normalized_sources.append({"n": take_per_batch, "data_path": data_path})
+	if total_take_per_batch != rollout_batch_size:
+		raise RolloutInitializationError(
+			f"混合数据集配置要求所有 n 之和严格等于 rollout_batch_size: {total_take_per_batch} != {rollout_batch_size}"
+		)
+	return normalized_sources
+
+
+async def _load_dataset_sources(
+	data_cfg: Any,
+	rollout_batch_size: int,
+	passed_iters: int,
+	rollout_mode: str,
+	completed_ids_path: Optional[str],
+	logger: logging.Logger,
+) -> List[DatasetSource]:
+	normalized_sources = _normalize_data_sources(data_cfg, rollout_batch_size)
+	completed_ids = _load_completed_sample_ids(completed_ids_path) if rollout_mode == "eval" else set()
+	seen_eval_sample_ids: Set[str] = set()
+	dataset_sources: List[DatasetSource] = []
+	for source_index, source_cfg in enumerate(normalized_sources):
+		data_path = source_cfg["data_path"]
+		take_per_batch = source_cfg["n"]
+		samples = await _load_dataset(data_path, logger)
+		if rollout_mode == "eval":
+			samples = _prepare_eval_samples(
+				samples=samples,
+				completed_ids=completed_ids,
+				seen_ids=seen_eval_sample_ids,
+				logger=logger,
+				data_path=data_path,
+			)
+			cursor = 0
+		else:
+			samples = samples.shuffle(seed=42 + source_index)
+			if len(samples) == 0:
+				raise RolloutInitializationError(f"训练模式下数据集为空，无法执行 rollout: {data_path}")
+			cursor = (take_per_batch * passed_iters) % len(samples)
+		dataset_sources.append(
+			DatasetSource(
+				data_path=data_path,
+				take_per_batch=take_per_batch,
+				samples=samples,
+				cursor=cursor,
+			)
+		)
+	return dataset_sources
+
+
+def _build_train_batch_samples(
+	context: RolloutContext,
+	rollout_step: int,
+) -> List[Dict[str, Any]]:
+	batch_samples: List[Dict[str, Any]] = []
+	for source in context.dataset_sources:
+		total_samples = len(source.samples)
+		if total_samples == 0:
+			raise RolloutInitializationError(f"训练模式下数据集为空，无法执行 rollout: {source.data_path}")
+		for _ in range(source.take_per_batch):
+			batch_samples.append(source.samples[source.cursor])
+			source.cursor = (source.cursor + 1) % total_samples
+	return _shuffle_batch_samples(batch_samples, rollout_step)
+
+
+def _build_eval_batch_samples(
+	context: RolloutContext,
+	rollout_step: int,
+) -> List[Dict[str, Any]]:
+	batch_samples: List[Dict[str, Any]] = []
+	for source in context.dataset_sources:
+		remaining_samples = len(source.samples) - source.cursor
+		if remaining_samples <= 0:
+			continue
+		take_count = min(source.take_per_batch, remaining_samples)
+		for _ in range(take_count):
+			batch_samples.append(source.samples[source.cursor])
+			source.cursor += 1
+	if not batch_samples:
+		return []
+	return _shuffle_batch_samples(batch_samples, rollout_step)
+
+
+def _shuffle_batch_samples(batch_samples: List[Dict[str, Any]], rollout_step: int) -> List[Dict[str, Any]]:
+	if len(batch_samples) <= 1:
+		return batch_samples
+	shuffled_samples = list(batch_samples)
+	random.Random(f"rollout-step-{rollout_step}").shuffle(shuffled_samples)
+	return shuffled_samples
+
+
+def _collect_dataset_types(dataset_sources: List[DatasetSource]) -> Set[str]:
+	data_types: Set[str] = set()
+	for source in dataset_sources:
+		if len(source.samples) == 0:
+			continue
+		for data_type in source.samples.unique("dataset_type"):
+			data_types.add(data_type)
+	return data_types
+
+
+def _load_completed_sample_ids(completed_ids_path: Optional[str]) -> set:
+	if not completed_ids_path or not os.path.exists(completed_ids_path):
+		return set()
+	completed_ids = set()
+	with open(completed_ids_path, "r", encoding="utf-8") as file_obj:
+		for line in file_obj:
+			line = line.strip()
+			if line:
+				completed_ids.add(line)
+	return completed_ids
+
+
+async def _load_dataset(data_path_value: Optional[str], logger: logging.Logger) -> datasets.Dataset:
+	logger.info("开始加载数据集，路径=%s", data_path_value)
+	return await asyncio.to_thread(load_from_disk, data_path_value)
+
+
+async def _stop_services(services: List[AsyncBaseService], logger: logging.Logger) -> None:
+	if not services:
+		return
+	logger.warning("开始停止所有 service，数量=%s", len(services))
+	for service in services:
+		try:
+			await service.stop()
+			logger.info("service %s 停止成功", service.name)
+		except Exception:
+			logger.error("service %s 停止失败", service.name)
+
+
+async def _queue_get(input_queue):
+	def _get():
+		try:
+			return input_queue.get(timeout=0.5)
+		except queue.Empty:
+			return None
+		except (EOFError, OSError):
+			return None
+	return await asyncio.to_thread(_get)
+
+
+async def _queue_put(output_queue, item) -> None:
+	await asyncio.to_thread(output_queue.put, item)
